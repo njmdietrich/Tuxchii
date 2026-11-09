@@ -102,7 +102,7 @@ index 2a2563a131..16b3045925 100644
      Settings::AspectRatio ratio;
      Settings::ResolutionSetup resolution_setting;
 diff --git a/src/yuzu/fritchii/fritchii_ui.cpp b/src/yuzu/fritchii/fritchii_ui.cpp
-index 7e7867b82d..08cd0c12f0 100644
+index 0dc2158ee7..f1c53ecaf2 100644
 --- a/src/yuzu/fritchii/fritchii_ui.cpp
 +++ b/src/yuzu/fritchii/fritchii_ui.cpp
 @@ -28,6 +28,7 @@
@@ -113,9 +113,17 @@ index 7e7867b82d..08cd0c12f0 100644
  #include "qt_common/qt_common.h"
  #include "ui_main.h"
  #ifdef HAS_RESHADE
-@@ -112,7 +113,13 @@ void Rename(QAction* action, const QString& text) {
+@@ -111,8 +112,21 @@ void Rename(QAction* action, const QString& text) {
+ } // namespace
  
  bool Enabled() {
++    // main() asks before the settings file is loaded (to pick high-DPI rounding). Answer from the
++    // environment only and don't cache it, so the saved setting decides once it has been read.
++    if (QCoreApplication::instance() == nullptr) {
++        return qEnvironmentVariableIsSet("FRITCHII_CLASSIC_UI") &&
++               qEnvironmentVariableIntValue("FRITCHII_CLASSIC_UI") == 0 &&
++               std::string_view{Common::g_build_name} == "Fritchii";
++    }
      static const bool enabled = [] {
 -        if (qEnvironmentVariableIntValue("FRITCHII_CLASSIC_UI") != 0) {
 +        // FRITCHII_CLASSIC_UI=1 forces the classic UI, =0 forces Fritchii's; unset follows the
