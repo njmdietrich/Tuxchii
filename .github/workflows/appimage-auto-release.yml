@@ -5,6 +5,9 @@
 # - Every 2 hours it checks Frizti/Fritchii's newest "fritchii-*" releases (BACKFILL of them).
 # - Each one this repo has no "appimage-<tag>" release for yet is built and published.
 # - Run it by hand from the Actions tab to build now, or to rebuild a specific tag.
+# - TEST BUILDS: run it from any other branch (Run workflow > "Use workflow from: testing").
+#   That builds the given tag (blank = newest) with that branch's patches and uploads the
+#   AppImage as a workflow artifact on the run's page. It never touches Releases.
 
 name: appimage-auto-release
 
@@ -44,6 +47,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
           FORCE: ${{ inputs.force }}
+          TEST_BUILD: ${{ github.ref_name != 'nx2' }}
         run: |
           set -euo pipefail
           # Published (non-draft) upstream releases whose tag starts with TAG_PREFIX, newest first.
@@ -54,12 +58,14 @@ jobs:
           echo "newest=$newest" >> "$GITHUB_OUTPUT"
           if [ -n "${INPUT_TAG:-}" ]; then
             candidates=("$INPUT_TAG")
+          elif [ "$TEST_BUILD" = "true" ]; then
+            candidates=("$newest") # a test build: just the newest version
           else
             candidates=("${releases[@]:0:$BACKFILL}")
           fi
           missing=()
           for tag in "${candidates[@]}"; do
-            if [ "${FORCE:-false}" != "true" ] &&
+            if [ "$TEST_BUILD" != "true" ] && [ "${FORCE:-false}" != "true" ] &&
                gh release view "appimage-$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
               echo "appimage-$tag already published"
             else
@@ -193,6 +199,17 @@ jobs:
             echo "applied classic-ui-setting.patch"
             echo "CLASSIC_UI_DEFAULT=1" >> "$GITHUB_ENV"
           fi
+          # 6. Any other .patch files on this branch (test fixes on a testing branch), in name order.
+          extra=""
+          for p in _linux-patches/.github/linux-patches/*.patch; do
+            name=$(basename "$p")
+            [ -e "$p" ] && [ "$name" != classic-ui-setting.patch ] || continue
+            git apply --check "$p" || { echo "::error::$name does not apply to $TAG"; exit 1; }
+            git apply "$p"
+            echo "applied $name"
+            extra="${extra:+$extra, }$name"
+          done
+          echo "EXTRA_PATCHES=$extra" >> "$GITHUB_ENV"
           git diff --stat
 
       - name: Configure
@@ -252,7 +269,34 @@ jobs:
           ls -la "$LDAI_OUTPUT"
           echo "APPIMAGE=$LDAI_OUTPUT" >> "$GITHUB_ENV"
 
+      # Test builds (any branch but nx2): an artifact on the run's page, never a release.
+      - name: Upload test build
+        if: github.ref_name != 'nx2'
+        run: |
+          sha256sum "$APPIMAGE" > "$APPIMAGE.sha256"
+          {
+            echo "TEST BUILD - not a release. Fritchii $TAG from branch $GITHUB_REF_NAME"
+            echo "(commit $GITHUB_SHA), run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Extra patches: ${EXTRA_PATCHES:-none}"
+            echo
+            echo "The zip drops the executable bit: chmod +x $APPIMAGE before running it."
+          } > TEST-BUILD.txt
+          echo "TEST_ARTIFACT=Fritchii-${TAG#$TAG_PREFIX}-TEST-${GITHUB_REF_NAME//\//-}-run${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+
+      - name: Upload test build artifact
+        if: github.ref_name != 'nx2'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TEST_ARTIFACT }}
+          path: |
+            ${{ env.APPIMAGE }}
+            ${{ env.APPIMAGE }}.sha256
+            TEST-BUILD.txt
+          retention-days: 30
+          if-no-files-found: error
+
       - name: Publish release
+        if: github.ref_name == 'nx2'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
