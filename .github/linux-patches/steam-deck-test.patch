@@ -1,0 +1,97 @@
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 40613f31d9..ca31a099fd 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -3564,7 +3564,15 @@ void PipelineCache::StartPrecompiled(u64 title_id, const std::filesystem::path&
+     }
+     // The prepared pipelines are kept by the driver's own cache. Without one they would go to the
+     // emulator's pipeline cache file, which is loaded whole at boot: only on request there.
+-    if (!DriverCachesPipelines(device) && mode < 2) {
++#ifdef __linux__
++    // Linux build patch: Mesa's drivers (RADV on the Steam Deck, ANV, NVK) are skipped upstream, so
++    // the game compiled every shader while playing. Prepare them there too: the pipelines then go
++    // to the emulator's own pipeline cache file (as with EDEN_NX2_PRECOMPILE=2).
++    constexpr bool skip_without_driver_cache = false;
++#else
++    constexpr bool skip_without_driver_cache = true;
++#endif
++    if (skip_without_driver_cache && !DriverCachesPipelines(device) && mode < 2) {
+         LOG_INFO(Render_Vulkan, "Precompiled pipelines skipped: the driver keeps no pipeline cache "
+                                 "of its own (EDEN_NX2_PRECOMPILE=2 prepares them anyway)");
+         return;
+diff --git a/src/yuzu/fritchii/main_window_fritchii.cpp b/src/yuzu/fritchii/main_window_fritchii.cpp
+index 7702ae42b9..3faf706c50 100644
+--- a/src/yuzu/fritchii/main_window_fritchii.cpp
++++ b/src/yuzu/fritchii/main_window_fritchii.cpp
+@@ -26,6 +26,9 @@
+ 
+ void MainWindow::SetUpFritchiiUi() {
+     if (!FritchiiUi::Enabled()) {
++        // Linux build patch: the classic interface gets the "Preparing shaders" screen too, so the
++        // shaders are prepared before playing instead of competing with the game for the CPU.
++        SetUpPrecompileGate();
+         return;
+     }
+ 
+@@ -153,6 +156,12 @@ void MainWindow::SetUpFritchiiUi() {
+     connect(this, &MainWindow::EmulationStarting, controls, &FritchiiUi::GameControls::Start);
+     connect(this, &MainWindow::EmulationStopping, controls, &FritchiiUi::GameControls::Stop);
+ 
++    SetUpPrecompileGate();
++}
++
++// Linux build patch: shared by both interfaces (upstream sets it up in Fritchii's only).
++void MainWindow::SetUpPrecompileGate() {
++    constexpr u64 OcarinaOfTime = 0x0400486024DEC000ULL;
+     // "Preparing shaders" before the game starts when its precompiled pipelines need preparing.
+     auto* gate = new FritchiiUi::PrecompileGate(
+         this, statusBar(),
+diff --git a/src/yuzu/main_window.cpp b/src/yuzu/main_window.cpp
+index cc2ba56561..28497a9772 100644
+--- a/src/yuzu/main_window.cpp
++++ b/src/yuzu/main_window.cpp
+@@ -9,6 +9,7 @@
+ #endif
+ 
+ #include <boost/algorithm/string/split.hpp>
++#include <fstream>
+ #include "common/fs/path_util.h"
+ #include "common/game_presets.h"
+ #include "common/shutdown_progress.h"
+@@ -653,6 +654,24 @@ void MainWindow::MigrateFriztiSettings() {
+     for (auto& change : Frizti::FixDockedController(Settings::values)) {
+         changes.push_back(std::move(change));
+     }
++#ifdef __linux__
++    // Linux build patch: on a Steam Deck, switch to handheld mode once. Docked renders at 1080p,
++    // too heavy for its GPU (6-8 fps in the Deku Tree); handheld is 720p. Later choices are kept.
++    {
++        std::ifstream vendor_file("/sys/devices/virtual/dmi/id/board_vendor");
++        std::string vendor;
++        std::getline(vendor_file, vendor);
++        const auto marker =
++            Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "linux-steam-deck-handheld";
++        if (vendor.starts_with("Valve") && !Common::FS::Exists(marker)) {
++            if (Settings::values.use_docked_mode.GetValue() != Settings::ConsoleMode::Handheld) {
++                Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
++                changes.push_back({"use_docked_mode", "Docked", "Handheld (Steam Deck)"});
++            }
++            std::ofstream{marker} << "Handheld mode was set once for this Steam Deck.\n";
++        }
++    }
++#endif
+ 
+     // Ocarina's per-game config, loaded as a game boot does.
+     std::map<std::string, std::string> per_game;
+diff --git a/src/yuzu/main_window.h b/src/yuzu/main_window.h
+index 871f4ed867..72c8300067 100644
+--- a/src/yuzu/main_window.h
++++ b/src/yuzu/main_window.h
+@@ -411,6 +411,7 @@ private slots:
+     void ShowErrorWithExportLog(const QString& title, const QString& text);
+     /// The Fritchii look (fritchii/main_window_fritchii.cpp); nothing in Lichii builds.
+     void SetUpFritchiiUi();
++    void SetUpPrecompileGate();
+     void OnVerifyInstalledContents();
+     void OnInstallFirmware();
+     void OnInstallFirmwareFromZIP();
