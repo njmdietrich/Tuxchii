@@ -1,0 +1,84 @@
+name: Linux AppImage problem
+description: Something is wrong with a Fritchii Linux AppImage from this repo (won't start, crashes, looks wrong, slow...)
+title: "[Linux] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! This repo only builds the **Linux AppImages** of [Frizti's Fritchii](https://github.com/Frizti/Fritchii).
+        The more of the details below you can give, the faster it can be fixed.
+        Please don't ask for or post games, keys or firmware.
+  - type: input
+    id: version
+    attributes:
+      label: Which AppImage?
+      description: The file name you downloaded
+      placeholder: Fritchii-v5.5-x86_64.AppImage
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Linux distribution and version
+      placeholder: Ubuntu 24.04 / Fedora 41 / Arch / SteamOS 3.7 / Bazzite ...
+    validations:
+      required: true
+  - type: dropdown
+    id: session
+    attributes:
+      label: Desktop session
+      options:
+        - Wayland
+        - X11
+        - Steam Deck Game Mode (gamescope)
+        - Don't know
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver version
+      description: "Run `vulkaninfo --summary` if you're unsure (look for deviceName and driverInfo)"
+      placeholder: "NVIDIA RTX 3070, driver 580.95 / AMD RX 6700 XT, Mesa 25.2 / Steam Deck"
+    validations:
+      required: true
+  - type: dropdown
+    id: interface
+    attributes:
+      label: Which interface?
+      description: Settings → UI → "Use the Fritchii interface"
+      options:
+        - Classic (default)
+        - Fritchii interface
+        - Both / doesn't matter
+        - Can't get that far
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead. Include any error message.
+      placeholder: |
+        1. Started the AppImage from a terminal
+        2. Opened Ocarina of Time
+        3. It crashed during "Preparing shaders" with ...
+    validations:
+      required: true
+  - type: textarea
+    id: terminal
+    attributes:
+      label: Terminal output or log
+      description: |
+        Start the AppImage from a terminal and paste the last lines it prints, or attach the log file
+        (`~/.local/share/eden/log/eden_log.txt`, or Help → Export Log in the Fritchii interface).
+      render: text
+  - type: dropdown
+    id: windows
+    attributes:
+      label: Does the same thing happen in Frizti's Windows build?
+      description: If it's also broken on Windows, it's probably an upstream bug.
+      options:
+        - Don't know / not tested
+        - "No, only on Linux"
+        - "Yes, Windows too"
