@@ -253,6 +253,9 @@ jobs:
           sha256sum "$APPIMAGE" > "$APPIMAGE.sha256"
           export VER="${TAG#$TAG_PREFIX}" COMMIT="$(git rev-parse --short HEAD)"
           export SHA256="$(cut -d' ' -f1 "$APPIMAGE.sha256")" CLASSIC="${CLASSIC_UI_DEFAULT:-0}"
+          # Frizti's own release notes for this version (the changelog), if the release has any.
+          gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq .body > "$RUNNER_TEMP/upstream.md" 2>/dev/null ||
+            : > "$RUNNER_TEMP/upstream.md"
           # Release notes: the same layout for every version. {{...}} are filled in below.
           cat > "$RUNNER_TEMP/notes.md" <<'EOF'
           Linux x86_64 AppImage of [Fritchii {{VER}}](https://github.com/{{UPSTREAM}}/releases/tag/{{TAG}}), built automatically on GitHub from upstream commit `{{COMMIT}}`.
@@ -281,6 +284,7 @@ jobs:
           __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1
           ```
 
+          {{CHANGELOG}}
           ## Linux changes in this build
           Fritchii is only tested on Windows, so a few small changes are applied before compiling (all visible in the public build log):
           {{CLASSIC_BULLET}}- **Compile fixes** for Windows-only code paths (X11 `Status` macro clash, Linux `GetExeDirectory()`, a Windows-only log variable), applied only where needed
@@ -306,7 +310,17 @@ jobs:
           notes, classic, repo = open(sys.argv[1]).read(), open(sys.argv[2]).read(), sys.argv[3]
           on = os.environ["CLASSIC"] == "1"
           link = f"https://github.com/{repo}/blob/{os.environ.get('GITHUB_REF_NAME', 'nx2')}/.github/linux-patches/classic-ui-setting.patch"
+          # Frizti's changelog: everything after the first "---" line (above it are the Windows
+          # download instructions, which don't apply to the AppImage).
+          upstream = open(os.path.join(os.environ["RUNNER_TEMP"], "upstream.md")).read().replace("\r\n", "\n")
+          parts = upstream.split("\n---\n", 1)
+          changelog = (parts[1] if len(parts) == 2 else upstream).strip()
+          if changelog:
+              changelog = (f"## What's new in Fritchii {os.environ['VER']}\n"
+                           f"*From Frizti's [release notes](https://github.com/{os.environ['UPSTREAM']}/releases/tag/"
+                           f"{os.environ['TAG']}) (Windows download instructions left out).*\n\n{changelog}\n\n")
           values = {
+              "CHANGELOG": changelog,
               "VER": os.environ["VER"], "TAG": os.environ["TAG"], "UPSTREAM": os.environ["UPSTREAM"],
               "COMMIT": os.environ["COMMIT"], "SHA256": os.environ["SHA256"], "APPIMAGE": os.environ["APPIMAGE"],
               "CLASSIC_SECTION": classic if on else "",
