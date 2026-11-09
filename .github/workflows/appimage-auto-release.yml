@@ -36,6 +36,7 @@ jobs:
     outputs:
       tag: ${{ steps.find.outputs.tag }}
       build: ${{ steps.find.outputs.build }}
+      latest: ${{ steps.find.outputs.latest }}
     steps:
       - id: find
         env:
@@ -44,18 +45,18 @@ jobs:
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          if [ -n "${INPUT_TAG:-}" ]; then
-            tag="$INPUT_TAG"
-          else
-            # Newest published (non-draft) release whose tag starts with TAG_PREFIX.
-            tag=$(gh api "repos/$UPSTREAM/releases?per_page=50" --jq \
-              "[.[] | select(.draft | not) | select(.tag_name | startswith(\"$TAG_PREFIX\"))]
-               | sort_by(.published_at) | last | .tag_name // empty")
-          fi
+          # Newest published (non-draft) release whose tag starts with TAG_PREFIX.
+          newest=$(gh api "repos/$UPSTREAM/releases?per_page=50" --jq \
+            "[.[] | select(.draft | not) | select(.tag_name | startswith(\"$TAG_PREFIX\"))]
+             | sort_by(.published_at) | last | .tag_name // empty")
+          tag="${INPUT_TAG:-$newest}"
           if [ -z "$tag" ]; then
             echo "No $TAG_PREFIX* release found upstream"; echo "build=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Only the newest upstream version gets GitHub's "Latest" label, so building an older
+          # version by hand never takes it away from the current one.
+          if [ "$tag" = "$newest" ]; then echo "latest=true"; else echo "latest=false"; fi >> "$GITHUB_OUTPUT"
           if [ "${FORCE:-false}" != "true" ] &&
              gh release view "appimage-$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "appimage-$tag already published; nothing to do"
@@ -78,6 +79,7 @@ jobs:
       cancel-in-progress: false
     env:
       TAG: ${{ needs.check.outputs.tag }}
+      LATEST: ${{ needs.check.outputs.latest }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 3000M
       CCACHE_COMPILERCHECK: content
@@ -143,6 +145,14 @@ jobs:
           if grep -qF 'g_committed_bytes.load(std::memory_order_relaxed) >> 20);' "$f"; then
             sed -i 's/g_committed_bytes\.load(std::memory_order_relaxed) >> 20);/GetCommitStats().committed_bytes >> 20);/' "$f"
             echo "patched $f"
+          fi
+          # 3. v5: nx2_precompile.cpp calls Common::FS::GetExeDirectory(), which only exists on
+          #    Windows. Add a Linux version (directory of /proc/self/exe), unless upstream has one.
+          h=src/common/fs/path_util.h; c=src/common/fs/path_util.cpp
+          if [ "$(grep -c 'GetExeDirectory();' "$h")" = 1 ] && [ "$(grep -c 'path GetExeDirectory()' "$c")" = 1 ]; then
+            sed -i 's|^} // namespace Common::FS$|#ifndef _WIN32\n[[nodiscard]] std::filesystem::path GetExeDirectory(); // Linux build patch\n#endif\n\n} // namespace Common::FS|' "$h"
+            sed -i 's|^} // namespace Common::FS$|#ifndef _WIN32\nfs::path GetExeDirectory() { // Linux build patch\n    std::error_code ec;\n    if (auto exe = fs::read_symlink("/proc/self/exe", ec); !ec) {\n        return exe.parent_path();\n    }\n    return fs::current_path(ec);\n}\n#endif\n\n} // namespace Common::FS|' "$c"
+            echo "patched GetExeDirectory for Linux"
           fi
           git diff --stat
 
@@ -216,7 +226,9 @@ jobs:
           \`chmod +x $APPIMAGE\` then run it; if it complains about FUSE, add \`--appimage-extract-and-run\`."
           if gh release view "$rel" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$rel" "$APPIMAGE" "$APPIMAGE.sha256" --clobber --repo "$GITHUB_REPOSITORY"
+            if [ "$LATEST" = "true" ]; then gh release edit "$rel" --latest --repo "$GITHUB_REPOSITORY"; fi
           else
             gh release create "$rel" "$APPIMAGE" "$APPIMAGE.sha256" --repo "$GITHUB_REPOSITORY" \
-              --title "Fritchii ${TAG#$TAG_PREFIX} (Linux AppImage)" --notes "$notes"
+              --title "Fritchii ${TAG#$TAG_PREFIX} (Linux AppImage)" --notes "$notes" \
+              --latest="${LATEST:-false}"
           fi
