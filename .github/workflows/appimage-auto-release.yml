@@ -2,7 +2,7 @@
 # release in this repository.
 #
 # Put this file at .github/workflows/appimage-auto-release.yml on your fork's default branch.
-# - Every 6 hours it checks Frizti/Fritchii for the newest "fritchii-*" release.
+# - Every 2 hours it checks Frizti/Fritchii for the newest "fritchii-*" release.
 # - If this repo has no "appimage-<tag>" release for it yet, it builds and publishes one.
 # - Run it by hand from the Actions tab to build now, or to rebuild a specific tag.
 
@@ -10,7 +10,7 @@ name: appimage-auto-release
 
 on:
   schedule:
-    - cron: "17 */2 * * *" # every 6 hours, at :17
+    - cron: "17 */2 * * *" # every 2 hours, at :17
   workflow_dispatch:
     inputs:
       tag:
@@ -91,6 +91,13 @@ jobs:
           ref: ${{ needs.check.outputs.tag }}
           submodules: recursive
 
+      # This repo's own patch files (.github/linux-patches), checked out beside the source.
+      - name: Check out Linux patches
+        uses: actions/checkout@v5
+        with:
+          path: _linux-patches
+          sparse-checkout: .github/linux-patches
+
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -153,6 +160,16 @@ jobs:
             sed -i 's|^} // namespace Common::FS$|#ifndef _WIN32\n[[nodiscard]] std::filesystem::path GetExeDirectory(); // Linux build patch\n#endif\n\n} // namespace Common::FS|' "$h"
             sed -i 's|^} // namespace Common::FS$|#ifndef _WIN32\nfs::path GetExeDirectory() { // Linux build patch\n    std::error_code ec;\n    if (auto exe = fs::read_symlink("/proc/self/exe", ec); !ec) {\n        return exe.parent_path();\n    }\n    return fs::current_path(ec);\n}\n#endif\n\n} // namespace Common::FS|' "$c"
             echo "patched GetExeDirectory for Linux"
+          fi
+          # 4. Classic UI by default, with "Use the Fritchii interface" in Settings > UI.
+          #    Only for versions that have Fritchii's own interface (v5 and later).
+          p=_linux-patches/.github/linux-patches/classic-ui-setting.patch
+          if [ -f src/yuzu/fritchii/fritchii_ui.cpp ]; then
+            git apply --check "$p" || git apply --check -C1 "$p" ||
+              { echo "::error::classic-ui-setting.patch no longer applies to $TAG; it needs updating"; exit 1; }
+            git apply "$p" 2>/dev/null || git apply -C1 "$p"
+            echo "applied classic-ui-setting.patch"
+            echo "CLASSIC_UI_DEFAULT=1" >> "$GITHUB_ENV"
           fi
           git diff --stat
 
@@ -224,8 +241,14 @@ jobs:
 
           Unofficial build. Needs glibc 2.39+ (Ubuntu 24.04, Fedora 40, current Arch/SteamOS or newer).
           \`chmod +x $APPIMAGE\` then run it; if it complains about FUSE, add \`--appimage-extract-and-run\`."
+          if [ "${CLASSIC_UI_DEFAULT:-0}" = 1 ]; then
+            notes="$notes
+
+          Opens in the classic interface, which follows your system theme, font size and scaling. To use Fritchii's own interface, tick **Use the Fritchii interface** in Settings → UI and restart."
+          fi
           if gh release view "$rel" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$rel" "$APPIMAGE" "$APPIMAGE.sha256" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$rel" --notes "$notes" --repo "$GITHUB_REPOSITORY"
             if [ "$LATEST" = "true" ]; then gh release edit "$rel" --latest --repo "$GITHUB_REPOSITORY"; fi
           else
             gh release create "$rel" "$APPIMAGE" "$APPIMAGE.sha256" --repo "$GITHUB_REPOSITORY" \
