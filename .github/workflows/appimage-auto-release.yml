@@ -124,18 +124,27 @@ jobs:
           cache: true
 
       - name: Restore compiler cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: .ccache
           key: ccache-appimage-${{ needs.check.outputs.tag }}-${{ github.run_id }}
           restore-keys: ccache-appimage-
 
-      # X11's Xlib.h does "#define Status int", which breaks VideoCommon's Status enum on Linux.
-      - name: Patch X11 Status macro clash
+      # Upstream only builds for Windows, so a few things break on Linux. Each patch is applied only
+      # where its pattern is present, so a release that fixes it upstream just skips the patch.
+      - name: Apply Linux build patches
         run: |
+          # 1. X11's Xlib.h does "#define Status int", which breaks VideoCommon's Status enum.
           f=src/video_core/vulkan_common/vulkan.h
           grep -q '^#undef Status' "$f" || sed -i 's/^#undef True$/#undef True\n#undef Status/' "$f"
           grep -q '^#undef Status' "$f" || { echo "::error::could not patch $f"; exit 1; }
+          # 2. v5: CommitAllBut logs g_committed_bytes, which only exists in the Windows build.
+          f=src/common/host_memory.cpp
+          if grep -qF 'g_committed_bytes.load(std::memory_order_relaxed) >> 20);' "$f"; then
+            sed -i 's/g_committed_bytes\.load(std::memory_order_relaxed) >> 20);/GetCommitStats().committed_bytes >> 20);/' "$f"
+            echo "patched $f"
+          fi
+          git diff --stat
 
       - name: Configure
         run: |
@@ -161,7 +170,7 @@ jobs:
       # Saved even when the build fails, so a re-run picks up where it stopped.
       - name: Save compiler cache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: .ccache
           key: ccache-appimage-${{ needs.check.outputs.tag }}-${{ github.run_id }}
