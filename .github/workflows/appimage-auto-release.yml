@@ -175,6 +175,14 @@ jobs:
             sed -i 's|^} // namespace Common::FS$|#ifndef _WIN32\nfs::path GetExeDirectory() { // Linux build patch\n    std::error_code ec;\n    if (auto exe = fs::read_symlink("/proc/self/exe", ec); !ec) {\n        return exe.parent_path();\n    }\n    return fs::current_path(ec);\n}\n#endif\n\n} // namespace Common::FS|' "$c"
             echo "patched GetExeDirectory for Linux"
           fi
+          # 5. v5.5: main() sets NVIDIA's shader disk cache size (10 GiB) only "if (FritchiiUi::Enabled())".
+          #    That runs before the settings file is read, so with the classic-UI patch it would never
+          #    run here. Upstream always runs it in Fritchii builds: keep it independent of the interface.
+          f=src/yuzu/main.cpp
+          if grep -q '__GL_SHADER_DISK_CACHE_SKIP_CLEANUP' "$f"; then
+            sed -i '/^    if (FritchiiUi::Enabled()) {$/{N;s|^    if (FritchiiUi::Enabled()) {\n\(\s*if (!qEnvironmentVariableIsSet("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"))\)|    { // Linux build patch: not tied to the interface choice\n\1|}' "$f"
+            grep -q 'Linux build patch: not tied to the interface choice' "$f" && echo "patched NVIDIA shader cache size for Linux"
+          fi
           # 4. Classic UI by default, with "Use the Fritchii interface" in Settings > UI.
           #    Only for versions that have Fritchii's own interface (v5 and later).
           p=_linux-patches/.github/linux-patches/classic-ui-setting.patch
