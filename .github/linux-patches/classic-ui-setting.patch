@@ -1,0 +1,130 @@
+diff --git a/src/qt_common/config/uisettings.h b/src/qt_common/config/uisettings.h
+index eaaa21270c..2f74fb77b9 100644
+--- a/src/qt_common/config/uisettings.h
++++ b/src/qt_common/config/uisettings.h
+@@ -145,6 +145,8 @@ struct Values {
+     // Release tag the user chose to skip, and the epoch second before which updates stay quiet.
+     Setting<std::string> skipped_update_tag{linkage, {}, "skipped_update_tag", Category::Ui};
+     Setting<unsigned long long> update_remind_at{linkage, 0, "update_remind_at", Category::Ui};
++    // Linux builds: Fritchii's own interface is opt-in (Settings > UI). Off = the classic UI.
++    Setting<bool> fritchii_ui{linkage, false, "fritchii_ui", Category::Ui};
+     // The Fritchii version whose "What's new" window was shown (yuzu/fritchii/whats_new.cpp).
+     Setting<std::string> fritchii_whats_new_seen{linkage, {}, "fritchii_whats_new_seen",
+                                                  Category::Ui};
+diff --git a/src/yuzu/configuration/configure_ui.cpp b/src/yuzu/configuration/configure_ui.cpp
+index 3f2b793d86..c2f82f3892 100644
+--- a/src/yuzu/configuration/configure_ui.cpp
++++ b/src/yuzu/configuration/configure_ui.cpp
+@@ -14,6 +14,7 @@
+ #include <QCoreApplication>
+ #include <QDirIterator>
+ #include <QFileDialog>
++#include <QMessageBox>
+ #include <QString>
+ #include <QToolButton>
+ #include <QVariant>
+@@ -93,6 +94,10 @@ ConfigureUi::ConfigureUi(Core::System& system_, QWidget* parent)
+       resolution_setting{Settings::values.resolution_setup.GetValue()}, system{system_} {
+     ui->setupUi(this);
+ 
++    fritchii_ui_checkbox = new QCheckBox(this);
++    ui->verticalLayout_2->insertWidget(0, fritchii_ui_checkbox);
++    RetranslateFritchiiUiCheckbox();
++
+     InitializeLanguageComboBox();
+ 
+     for (const auto& theme : UISettings::themes) {
+@@ -149,6 +154,12 @@ ConfigureUi::ConfigureUi(Core::System& system_, QWidget* parent)
+ ConfigureUi::~ConfigureUi() = default;
+ 
+ void ConfigureUi::ApplyConfiguration() {
++    const bool fritchii_ui = fritchii_ui_checkbox->isChecked();
++    if (fritchii_ui != UISettings::values.fritchii_ui.GetValue()) {
++        UISettings::values.fritchii_ui = fritchii_ui;
++        QMessageBox::information(this, tr("Restart required"),
++                                 tr("Restart Fritchii to switch interfaces."));
++    }
+     UISettings::values.theme =
+         ui->theme_combobox->itemData(ui->theme_combobox->currentIndex()).toString().toStdString();
+     UISettings::values.show_add_ons = ui->show_add_ons->isChecked();
+@@ -175,6 +186,7 @@ void ConfigureUi::RequestGameListUpdate() {
+ }
+ 
+ void ConfigureUi::SetConfiguration() {
++    fritchii_ui_checkbox->setChecked(UISettings::values.fritchii_ui.GetValue());
+     ui->theme_combobox->setCurrentIndex(
+         ui->theme_combobox->findData(QString::fromStdString(UISettings::values.theme)));
+     ui->language_combobox->setCurrentIndex(ui->language_combobox->findData(
+@@ -207,8 +219,16 @@ void ConfigureUi::changeEvent(QEvent* event) {
+     QWidget::changeEvent(event);
+ }
+ 
++void ConfigureUi::RetranslateFritchiiUiCheckbox() {
++    fritchii_ui_checkbox->setText(tr("Use the Fritchii interface (restart required)"));
++    fritchii_ui_checkbox->setToolTip(
++        tr("Fritchii's own dark interface with the home screen. When off, the classic interface "
++           "is used, which follows your system theme, font size and scaling."));
++}
++
+ void ConfigureUi::RetranslateUI() {
+     ui->retranslateUi(this);
++    RetranslateFritchiiUiCheckbox();
+ 
+     for (int i = 0; i < ui->folder_icon_size_combobox->count(); i++) {
+         ui->folder_icon_size_combobox->setItemText(
+diff --git a/src/yuzu/configuration/configure_ui.h b/src/yuzu/configuration/configure_ui.h
+index 2a2563a131..16b3045925 100644
+--- a/src/yuzu/configuration/configure_ui.h
++++ b/src/yuzu/configuration/configure_ui.h
+@@ -15,6 +15,8 @@ namespace Ui {
+ class ConfigureUi;
+ }
+ 
++class QCheckBox;
++
+ class ConfigureUi : public QWidget {
+     Q_OBJECT
+ 
+@@ -40,6 +42,7 @@ private:
+ 
+     void changeEvent(QEvent*) override;
+     void RetranslateUI();
++    void RetranslateFritchiiUiCheckbox();
+ 
+     void InitializeLanguageComboBox();
+     void InitializeIconSizeComboBox();
+@@ -51,6 +54,7 @@ private:
+     void UpdateWidthText();
+ 
+     std::unique_ptr<Ui::ConfigureUi> ui;
++    QCheckBox* fritchii_ui_checkbox = nullptr;
+ 
+     Settings::AspectRatio ratio;
+     Settings::ResolutionSetup resolution_setting;
+diff --git a/src/yuzu/fritchii/fritchii_ui.cpp b/src/yuzu/fritchii/fritchii_ui.cpp
+index 7e7867b82d..08cd0c12f0 100644
+--- a/src/yuzu/fritchii/fritchii_ui.cpp
++++ b/src/yuzu/fritchii/fritchii_ui.cpp
+@@ -28,6 +28,7 @@
+ #include "common/settings.h"
+ #include "core/core.h"
+ #include "qt_common/config/shared_translation.h"
++#include "qt_common/config/uisettings.h"
+ #include "qt_common/qt_common.h"
+ #include "ui_main.h"
+ #ifdef HAS_RESHADE
+@@ -112,7 +113,13 @@ void Rename(QAction* action, const QString& text) {
+ 
+ bool Enabled() {
+     static const bool enabled = [] {
+-        if (qEnvironmentVariableIntValue("FRITCHII_CLASSIC_UI") != 0) {
++        // FRITCHII_CLASSIC_UI=1 forces the classic UI, =0 forces Fritchii's; unset follows the
++        // "Use the Fritchii interface" setting (Settings > UI), which is off by default.
++        if (qEnvironmentVariableIsSet("FRITCHII_CLASSIC_UI")) {
++            if (qEnvironmentVariableIntValue("FRITCHII_CLASSIC_UI") != 0) {
++                return false;
++            }
++        } else if (!UISettings::values.fritchii_ui.GetValue()) {
+             return false;
+         }
+         return std::string_view{Common::g_build_name} == "Fritchii";
