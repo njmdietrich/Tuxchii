@@ -2,8 +2,8 @@
 # release in this repository.
 #
 # Put this file at .github/workflows/appimage-auto-release.yml on your fork's default branch.
-# - Every 2 hours it checks Frizti/Fritchii for the newest "fritchii-*" release.
-# - If this repo has no "appimage-<tag>" release for it yet, it builds and publishes one.
+# - Every 2 hours it checks Frizti/Fritchii's newest "fritchii-*" releases (BACKFILL of them).
+# - Each one this repo has no "appimage-<tag>" release for yet is built and published.
 # - Run it by hand from the Actions tab to build now, or to rebuild a specific tag.
 
 name: appimage-auto-release
@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Upstream tag to build (blank = newest fritchii-* release)
+        description: Upstream tag to build (blank = every missing recent fritchii-* release)
         required: false
         default: ""
       force:
@@ -25,18 +25,19 @@ on:
 env:
   UPSTREAM: Frizti/Fritchii
   TAG_PREFIX: fritchii-
+  BACKFILL: 3 # how many of the newest upstream releases to check for missing builds
 
 permissions:
   contents: read
 
 jobs:
   check:
-    name: Check for a new release
+    name: Check for new releases
     runs-on: ubuntu-24.04
     outputs:
-      tag: ${{ steps.find.outputs.tag }}
+      tags: ${{ steps.find.outputs.tags }}
+      newest: ${{ steps.find.outputs.newest }}
       build: ${{ steps.find.outputs.build }}
-      latest: ${{ steps.find.outputs.latest }}
     steps:
       - id: find
         env:
@@ -45,50 +46,63 @@ jobs:
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          # Newest published (non-draft) release whose tag starts with TAG_PREFIX.
-          newest=$(gh api "repos/$UPSTREAM/releases?per_page=50" --jq \
+          # Published (non-draft) upstream releases whose tag starts with TAG_PREFIX, newest first.
+          mapfile -t releases < <(gh api "repos/$UPSTREAM/releases?per_page=50" --jq \
             "[.[] | select(.draft | not) | select(.tag_name | startswith(\"$TAG_PREFIX\"))]
-             | sort_by(.published_at) | last | .tag_name // empty")
-          tag="${INPUT_TAG:-$newest}"
-          if [ -z "$tag" ]; then
-            echo "No $TAG_PREFIX* release found upstream"; echo "build=false" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          # Only the newest upstream version gets GitHub's "Latest" label, so building an older
-          # version by hand never takes it away from the current one.
-          if [ "$tag" = "$newest" ]; then echo "latest=true"; else echo "latest=false"; fi >> "$GITHUB_OUTPUT"
-          if [ "${FORCE:-false}" != "true" ] &&
-             gh release view "appimage-$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "appimage-$tag already published; nothing to do"
-            echo "build=false" >> "$GITHUB_OUTPUT"
+             | sort_by(.published_at) | reverse | .[].tag_name")
+          newest="${releases[0]:-}"
+          echo "newest=$newest" >> "$GITHUB_OUTPUT"
+          if [ -n "${INPUT_TAG:-}" ]; then
+            candidates=("$INPUT_TAG")
           else
-            echo "Will build $tag"
+            candidates=("${releases[@]:0:$BACKFILL}")
+          fi
+          missing=()
+          for tag in "${candidates[@]}"; do
+            if [ "${FORCE:-false}" != "true" ] &&
+               gh release view "appimage-$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "appimage-$tag already published"
+            else
+              echo "Will build $tag"; missing+=("$tag")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "tags=$(jq -cn '$ARGS.positional' --args "${missing[@]}")" >> "$GITHUB_OUTPUT"
             echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo 'tags=["none"]' >> "$GITHUB_OUTPUT" # placeholder; the build job is skipped
+            echo "build=false" >> "$GITHUB_OUTPUT"
           fi
 
   build:
-    name: Build ${{ needs.check.outputs.tag }} AppImage
+    name: Build ${{ matrix.tag }} AppImage
     needs: check
     if: needs.check.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.check.outputs.tags) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     permissions:
       contents: write
     concurrency:
-      group: appimage-${{ needs.check.outputs.tag }}
+      group: appimage-${{ matrix.tag }}
       cancel-in-progress: false
     env:
-      TAG: ${{ needs.check.outputs.tag }}
-      LATEST: ${{ needs.check.outputs.latest }}
+      TAG: ${{ matrix.tag }}
+      # Only the newest upstream version gets GitHub's "Latest" label, so building an older
+      # version never takes it away from the current one.
+      LATEST: ${{ matrix.tag == needs.check.outputs.newest }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 3000M
       CCACHE_COMPILERCHECK: content
     steps:
-      - name: Check out upstream source at ${{ needs.check.outputs.tag }}
+      - name: Check out upstream source at ${{ matrix.tag }}
         uses: actions/checkout@v5
         with:
           repository: ${{ env.UPSTREAM }}
-          ref: ${{ needs.check.outputs.tag }}
+          ref: ${{ matrix.tag }}
           submodules: recursive
 
       # This repo's own patch files (.github/linux-patches), checked out beside the source.
@@ -136,7 +150,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: .ccache
-          key: ccache-appimage-${{ needs.check.outputs.tag }}-${{ github.run_id }}
+          key: ccache-appimage-${{ matrix.tag }}-${{ github.run_id }}
           restore-keys: ccache-appimage-
 
       # Upstream only builds for Windows, so a few things break on Linux. Each patch is applied only
@@ -200,7 +214,7 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: .ccache
-          key: ccache-appimage-${{ needs.check.outputs.tag }}-${{ github.run_id }}
+          key: ccache-appimage-${{ matrix.tag }}-${{ github.run_id }}
 
       - name: Package AppImage
         run: |
@@ -237,21 +251,77 @@ jobs:
           set -euo pipefail
           rel="appimage-$TAG"
           sha256sum "$APPIMAGE" > "$APPIMAGE.sha256"
-          notes="Linux x86_64 AppImage of [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG), built automatically from upstream commit \`$(git rev-parse --short HEAD)\`.
+          export VER="${TAG#$TAG_PREFIX}" COMMIT="$(git rev-parse --short HEAD)"
+          export SHA256="$(cut -d' ' -f1 "$APPIMAGE.sha256")" CLASSIC="${CLASSIC_UI_DEFAULT:-0}"
+          # Release notes: the same layout for every version. {{...}} are filled in below.
+          cat > "$RUNNER_TEMP/notes.md" <<'EOF'
+          Linux x86_64 AppImage of [Fritchii {{VER}}](https://github.com/{{UPSTREAM}}/releases/tag/{{TAG}}), built automatically on GitHub from upstream commit `{{COMMIT}}`.
 
-          Unofficial build. Needs glibc 2.39+ (Ubuntu 24.04, Fedora 40, current Arch/SteamOS or newer).
-          \`chmod +x $APPIMAGE\` then run it; if it complains about FUSE, add \`--appimage-extract-and-run\`."
-          if [ "${CLASSIC_UI_DEFAULT:-0}" = 1 ]; then
-            notes="$notes
+          > ⚠️ Unofficial build. Fritchii only publishes Windows builds. Report Linux-specific problems here, not upstream.
+          {{CLASSIC_SECTION}}
+          ## Download
+          **`{{APPIMAGE}}`**
 
-          Opens in the classic interface, which follows your system theme, font size and scaling. To use Fritchii's own interface, tick **Use the Fritchii interface** in Settings → UI and restart."
-          fi
+          SHA-256: `{{SHA256}}`
+
+          ## Run it
+          ```bash
+          chmod +x {{APPIMAGE}}
+          ./{{APPIMAGE}}
+          ```
+          If it complains about FUSE, run it with `--appimage-extract-and-run`.
+
+          ## Requirements
+          - x86_64 Linux with **glibc 2.39+** (Ubuntu 24.04, Fedora 40, current Arch/SteamOS or newer)
+          - A GPU with a working **Vulkan** driver
+
+          **NVIDIA tip:** the driver trims its shader cache at about 1 GB by default, which can bring back stutter. Add these two lines to `/etc/environment` and reboot:
+          ```
+          __GL_SHADER_DISK_CACHE_SIZE=10737418240
+          __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1
+          ```
+
+          ## Linux changes in this build
+          Fritchii is only tested on Windows, so a few small changes are applied before compiling (all visible in the public build log):
+          {{CLASSIC_BULLET}}- **Compile fixes** for Windows-only code paths (X11 `Status` macro clash, Linux `GetExeDirectory()`, a Windows-only log variable), applied only where needed
+
+          ## Notes
+          - Games, keys and firmware are **not** included. Only use files you've legally dumped yourself.
+          - Thanks to Frizti, zortos293 and the Lichii/Eden/yuzu contributors.
+          EOF
+          cat > "$RUNNER_TEMP/classic.md" <<'EOF'
+
+          ## Classic interface by default
+
+          Fritchii's own dark interface (Graphite theme, Inter font, home screen) ignores your desktop theme, font size and scaling, which causes accessibility problems on Linux, so **this build opens in the classic interface**, which follows your system settings like any other Qt app.
+
+          To use Fritchii's interface instead:
+          - **Settings → UI → General → "Use the Fritchii interface (restart required)"**, then restart Fritchii. Untick it the same way to go back.
+          - Or for a single launch, set `FRITCHII_CLASSIC_UI=0` (forces Fritchii's interface) or `FRITCHII_CLASSIC_UI=1` (forces the classic one).
+
+          Emulation, performance and shader features are identical in both; only the interface changes.
+          EOF
+          python3 - "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP/classic.md" "$GITHUB_REPOSITORY" <<'PY'
+          import os, sys
+          notes, classic, repo = open(sys.argv[1]).read(), open(sys.argv[2]).read(), sys.argv[3]
+          on = os.environ["CLASSIC"] == "1"
+          link = f"https://github.com/{repo}/blob/{os.environ.get('GITHUB_REF_NAME', 'nx2')}/.github/linux-patches/classic-ui-setting.patch"
+          values = {
+              "VER": os.environ["VER"], "TAG": os.environ["TAG"], "UPSTREAM": os.environ["UPSTREAM"],
+              "COMMIT": os.environ["COMMIT"], "SHA256": os.environ["SHA256"], "APPIMAGE": os.environ["APPIMAGE"],
+              "CLASSIC_SECTION": classic if on else "",
+              "CLASSIC_BULLET": f"- **Classic interface by default**, with the settings checkbox above ([patch]({link}))\n" if on else "",
+          }
+          for k, v in values.items():
+              notes = notes.replace("{{" + k + "}}", v)
+          open(sys.argv[1], "w").write(notes)
+          PY
           if gh release view "$rel" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$rel" "$APPIMAGE" "$APPIMAGE.sha256" --clobber --repo "$GITHUB_REPOSITORY"
-            gh release edit "$rel" --notes "$notes" --repo "$GITHUB_REPOSITORY"
+            gh release edit "$rel" --notes-file "$RUNNER_TEMP/notes.md" --repo "$GITHUB_REPOSITORY"
             if [ "$LATEST" = "true" ]; then gh release edit "$rel" --latest --repo "$GITHUB_REPOSITORY"; fi
           else
             gh release create "$rel" "$APPIMAGE" "$APPIMAGE.sha256" --repo "$GITHUB_REPOSITORY" \
-              --title "Fritchii ${TAG#$TAG_PREFIX} (Linux AppImage)" --notes "$notes" \
+              --title "Fritchii ${TAG#$TAG_PREFIX} (Linux AppImage)" --notes-file "$RUNNER_TEMP/notes.md" \
               --latest="${LATEST:-false}"
           fi
