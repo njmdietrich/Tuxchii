@@ -259,9 +259,34 @@ jobs:
           export LINUXDEPLOY_OUTPUT_VERSION="$TAG"
           export LDAI_OUTPUT="Fritchii-${TAG#$TAG_PREFIX}-x86_64.AppImage"
           export OUTPUT="$LDAI_OUTPUT" ARCH=x86_64
+          # NVIDIA DLSS (when the DLSS patch is applied): the MIT-licensed Fritchii DLSS bridge as an
+          # object file and the mold linker (MIT), so Settings > Graphics > Install DLSS can link the
+          # bridge with NVIDIA's SDK files on the user's PC. Nothing of NVIDIA's is in the AppImage.
+          dlss_tools=()
+          bridge=_linux-patches/.github/linux-patches/dlss-bridge
+          if [ -f src/video_core/vulkan_common/streamline_linux.cpp ] && [ -f "$bridge/fritchii_dlss_bridge.cpp" ]; then
+            vk=$(find build .cache "$HOME/.cache" -path '*/include/vulkan/vulkan_core.h' -print -quit 2>/dev/null || true)
+            vkinc=${vk:+$(dirname "$(dirname "$vk")")}
+            [ -n "$vkinc" ] || { echo "::error::no Vulkan headers for the DLSS bridge"; exit 1; }
+            share=AppDir/usr/share/fritchii-dlss; mkdir -p "$share" AppDir/usr/share/doc/mold
+            flags="-O2 -fPIC -fvisibility=hidden -fno-stack-protector -U_FORTIFY_SOURCE"
+            g++ -std=c++20 $flags -Wall -I"$vkinc" -c "$bridge/fritchii_dlss_bridge.cpp" -o "$RUNNER_TEMP/fdb.o"
+            gcc $flags -Wall -c "$bridge/fritchii_dlss_dso.c" -o "$RUNNER_TEMP/fdb_dso.o"
+            ld -r "$RUNNER_TEMP/fdb.o" "$RUNNER_TEMP/fdb_dso.o" -o "$share/fritchii_dlss_bridge.o"
+            cp "$bridge/LICENSE" "$share/LICENSE"; cp "$bridge/README.md" "$share/README.md"
+            mold_tgz="$tools/mold.tar.gz"
+            curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o "$mold_tgz" \
+              https://github.com/rui314/mold/releases/download/v2.40.4/mold-2.40.4-x86_64-linux.tar.gz
+            echo "4c999e19ffa31afa5aa429c679b665d5e2ca5a6b6832ad4b79668e8dcf3d8ec1  $mold_tgz" | sha256sum -c -
+            tar -xzf "$mold_tgz" -C "$tools"
+            cp "$tools/mold-2.40.4-x86_64-linux/share/doc/mold/LICENSE" AppDir/usr/share/doc/mold/LICENSE
+            dlss_tools=(--executable "$tools/mold-2.40.4-x86_64-linux/bin/mold")
+            echo "DLSS bridge object and mold linker added"
+          fi
           "$tools/linuxdeploy-x86_64.AppImage" --appdir AppDir \
             --executable build/release/bin/lichii \
             --executable build/release/bin/eden-cli \
+            "${dlss_tools[@]}" \
             --desktop-file dist/io.github.zortos293.lichii.desktop \
             --icon-file "$icon" \
             --plugin qt \
