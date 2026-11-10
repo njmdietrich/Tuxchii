@@ -139,13 +139,18 @@ LINUX_OK = {"ToU8String"}  # declared Windows-only in one header but available o
 
 def scan_windows_only(base, new):
     headers = sh(["git", "ls-files", "src/*.h"], cwd=SRC).stdout.split()
-    win_funcs = {}
+    win_funcs, everywhere_all = {}, set()
     for h in headers:
         everywhere, win = set(), set()
         for _, line, w in regions(read(h)):
             (win if w else everywhere).update(CALL.findall(line))
+        everywhere_all |= everywhere
         for name in win - everywhere - LINUX_OK:
             win_funcs.setdefault(name, h)
+    # A name declared outside Windows-only code in any header (e.g. HostMemory::TrimZeroPages vs
+    # the Windows-only DeviceMemory::TrimZeroPages) is available on Linux too.
+    for name in everywhere_all:
+        win_funcs.pop(name, None)
     for f in changed_files(base, new, ["src/*.cpp", "src/*.h"]):
         if any(s in f.lower() for s in SKIP):
             continue
