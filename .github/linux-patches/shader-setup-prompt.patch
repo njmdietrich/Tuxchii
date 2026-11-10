@@ -1,0 +1,203 @@
+diff --git a/src/yuzu/main_window.cpp b/src/yuzu/main_window.cpp
+index 28497a9772..ec51c5c87c 100644
+--- a/src/yuzu/main_window.cpp
++++ b/src/yuzu/main_window.cpp
+@@ -2393,6 +2393,9 @@ bool MainWindow::OnShutdownBegin() {
+         return false;
+     }
+ 
++    // Linux build patch: closing the first-launch setup here must not start the game again.
++    shader_setup_run = false;
++    shader_setup_boot = false;
+     if (shader_warm_run_dialog) {
+         shader_warm_run_dialog->close();
+     }
+@@ -2658,6 +2661,9 @@ void MainWindow::UpdateRecentFiles() {
+ }
+ 
+ void MainWindow::OnGameListLoadFile(QString game_path, u64 program_id) {
++    if (OfferShaderSetup(game_path, program_id)) {
++        return;
++    }
+     auto params = ApplicationAppletParameters();
+     params.program_id = program_id;
+ 
+@@ -3487,6 +3493,12 @@ bool MainWindow::ConfirmShutdownGame() {
+ void MainWindow::OnLoadComplete() {
+     loading_screen->OnLoadComplete();
+ 
++    if (shader_setup_boot) {
++        shader_setup_boot = false;
++        // After the first frames, so the game is past its loading.
++        QTimer::singleShot(1500, this, &MainWindow::StartShaderSetupRun);
++    }
++
+     if (FritchiiUi::Enabled()) {
+         perf_overlay = new FritchiiUi::PerfOverlay(
+             this, [this] { ui->action_Show_Performance_Overlay->setChecked(false); });
+@@ -4560,6 +4572,84 @@ void MainWindow::OnGameListDeleteShaderWarm(u64 program_id) {
+     }
+ }
+ 
++// Linux build patch: asked once per game, on its first launch from the game list, when it has no
++// shader warm-up yet. Returns true when it took over the launch.
++bool MainWindow::OfferShaderSetup(const QString& game_path, u64 program_id) {
++    if (program_id == 0 || QtCommon::emu_thread != nullptr || shader_warm_dialog ||
++        ShaderWarmFilesExist(program_id)) {
++        return false;
++    }
++    const auto marker = Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) /
++                        "shader-setup-offered" / fmt::format("{:016X}", program_id);
++    std::error_code ec;
++    if (std::filesystem::exists(marker, ec)) {
++        return false;
++    }
++    std::filesystem::create_directories(marker, ec);
++
++    QMessageBox box(this);
++    box.setIcon(QMessageBox::Question);
++    box.setWindowTitle(tr("Prepare Shaders"));
++    box.setText(tr("Prepare this game's shaders before playing?"));
++    box.setInformativeText(
++        tr("All of the game's shaders are built once, so it plays without shader stutter. It "
++           "can take 20 to 40 minutes or more. The game starts paused while they build, and you "
++           "are told when it is ready to play.\n\nYou can also do it later: right-click the game "
++           "and choose Prepare shaders, then use Emulation > Prepare Shaders Now in the game."));
++    auto* prepare = box.addButton(tr("Prepare Shaders"), QMessageBox::AcceptRole);
++    box.addButton(tr("Play Now"), QMessageBox::RejectRole);
++    box.setDefaultButton(prepare);
++    box.exec();
++    if (box.clickedButton() != prepare) {
++        return false;
++    }
++
++    // Step 1: the warm-up files (a minute or two), then the game starts and step 2 builds them.
++    OnGameListPrepareShaderWarm(program_id, game_path.toStdString());
++    const QPointer<ShaderWarmDialog> dialog = shader_warm_dialog;
++    if (!dialog || !dialog->IsRunning()) {
++        return false;
++    }
++    connect(
++        dialog, &ShaderWarmDialog::BuildFinished, this,
++        [this, dialog, game_path, program_id](bool ok) {
++            if (!ok) {
++                return; // The window says why; the game is started from the list as usual.
++            }
++            if (dialog) {
++                dialog->close();
++            }
++            shader_setup_boot = true;
++            OnGameListLoadFile(game_path, program_id);
++            if (!emulation_running) {
++                shader_setup_boot = false;
++            }
++        },
++        Qt::QueuedConnection);
++    return true;
++}
++
++void MainWindow::StartShaderSetupRun() {
++    if (!emulation_running || !QtCommon::system->IsPoweredOn() ||
++        QtCommon::system->IsShuttingDown() ||
++        !QtCommon::system->GPU().ShaderNotify().WarmActive()) {
++        return;
++    }
++    // After the "Preparing shaders" screen (precompiled shaders), which holds the game itself.
++    if (QApplication::activeModalWidget() != nullptr) {
++        QTimer::singleShot(1000, this, &MainWindow::StartShaderSetupRun);
++        return;
++    }
++    if (QtCommon::emu_thread->IsRunning()) {
++        OnPauseGame();
++    }
++    shader_setup_run = true;
++    OnPrepareShadersNow();
++    if (!shader_warm_run_dialog) {
++        shader_setup_run = false;
++    }
++}
++
+ void MainWindow::OnPrepareShadersNow() {
+     if (!emulation_running || !QtCommon::system->IsPoweredOn()) {
+         return;
+@@ -4599,20 +4689,31 @@ void MainWindow::OnPrepareShadersNow() {
+     dialog->setLabel(label);
+     shader_warm_run_dialog = dialog;
+ 
++    const bool automatic = shader_setup_run;
+     const QString note =
+-        tr("The game keeps running and can stutter or slow down until this is done; pausing it "
+-           "makes this faster. Stop keeps what is built: the rest builds while the game is "
+-           "paused, or the next time you start this.");
++        automatic
++            ? tr("The game is paused while all of its shaders are built. This can take 20 to 40 "
++                 "minutes or more; you are told when it is done. Stop keeps what is built and "
++                 "starts the game: the rest builds whenever the game is paused.")
++            : tr("The game keeps running and can stutter or slow down until this is done; "
++                 "pausing it makes this faster. Stop keeps what is built: the rest builds while "
++                 "the game is paused, or the next time you start this.");
+     const QString tip = TakeShaderCacheTip();
+     auto* timer = new QTimer(dialog);
+-    const auto finish = [this, dialog, timer] {
++    const auto finish = [this, dialog, timer, automatic] {
+         timer->stop();
+         if (emulation_running && QtCommon::system->IsPoweredOn()) {
+             QtCommon::system->GPU().ShaderNotify().SetWarmRequested(false);
++            // Started paused by the first-launch setup: Play (or Stop) starts the game.
++            if (automatic && shader_setup_run && QtCommon::emu_thread &&
++                !QtCommon::emu_thread->IsRunning()) {
++                OnStartGame();
++            }
+         }
++        shader_setup_run = false;
+         dialog->deleteLater();
+     };
+-    const auto update = [this, dialog, timer, note, tip] {
++    const auto update = [this, dialog, timer, note, tip, automatic] {
+         if (!emulation_running || !QtCommon::system->IsPoweredOn() ||
+             QtCommon::system->IsShuttingDown()) {
+             dialog->close();
+@@ -4625,8 +4726,17 @@ void MainWindow::OnPrepareShadersNow() {
+             shader_notify.SetWarmRequested(false);
+             dialog->setRange(0, 1);
+             dialog->setValue(1);
+-            dialog->setCancelButtonText(tr("Close"));
+-            text = tr("Shaders are ready.");
++            if (automatic) {
++                dialog->setCancelButtonText(tr("Play"));
++                text = tr("All shaders are ready: the game is good to go.\n\nPress Play to start "
++                          "playing.");
++                QApplication::alert(this);
++                dialog->raise();
++                dialog->activateWindow();
++            } else {
++                dialog->setCancelButtonText(tr("Close"));
++                text = tr("Shaders are ready.");
++            }
+         } else {
+             const auto warm = shader_notify.GetWarmProgress();
+             const auto done = static_cast<qulonglong>(warm.done);
+diff --git a/src/yuzu/main_window.h b/src/yuzu/main_window.h
+index 72c8300067..87ff36be55 100644
+--- a/src/yuzu/main_window.h
++++ b/src/yuzu/main_window.h
+@@ -366,6 +366,10 @@ private slots:
+     void OnGameListPrepareShaderWarm(u64 program_id, const std::string& game_path);
+     void OnGameListDeleteShaderWarm(u64 program_id);
+     void OnPrepareShadersNow();
++    /// Linux build patch: a game's first launch offers to prepare all of its shaders, then starts
++    /// it paused, builds them and says when it is ready to play.
++    bool OfferShaderSetup(const QString& game_path, u64 program_id);
++    void StartShaderSetupRun();
+     void OnGameListExtractNup(const std::string& game_path);
+     void OnGameListEditNupMetadata(const std::string& game_path);
+     void OnGameListCopyTID(u64 program_id);
+@@ -633,6 +637,8 @@ private:
+     QPointer<ShaderWarmDialog> shader_warm_dialog;
+     QAction* action_prepare_shaders_now = nullptr;
+     QPointer<QProgressDialog> shader_warm_run_dialog;
++    bool shader_setup_boot{}; ///< The game was started by OfferShaderSetup
++    bool shader_setup_run{};  ///< Prepare Shaders Now was started by it
+     std::string nup_source_path;
+ 
+     // Last game booted, used for multi-process apps
