@@ -16,7 +16,7 @@
 extern "C" {
 #endif
 
-#define FDB_ABI_VERSION 1u
+#define FDB_ABI_VERSION 2u
 
 typedef struct FdbImage {
     VkImageView view;
@@ -65,6 +65,12 @@ int fdb_init(VkInstance instance, VkPhysicalDevice physical_device, VkDevice dev
              PFN_vkGetInstanceProcAddr get_instance_proc_addr,
              PFN_vkGetDeviceProcAddr get_device_proc_addr, const char* data_dir_utf8,
              const char* model_dir_utf8, FdbLogFn log);
+
+/// The render sizes DLSS accepts for an output size in a quality mode (see FdbEvaluate::quality).
+/// Returns 1 on success.
+int fdb_render_size_range(uint32_t output_width, uint32_t output_height, int32_t quality,
+                          uint32_t* min_width, uint32_t* min_height, uint32_t* max_width,
+                          uint32_t* max_height);
 
 /// Records one DLSS evaluation (creating or recreating the DLSS feature when its settings change).
 /// Returns 1 on success.
