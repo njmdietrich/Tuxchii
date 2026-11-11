@@ -1,0 +1,43 @@
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index cccddd3577..cef25f771b 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -671,6 +671,20 @@ bool DriverCachesPipelines(const Device& device) {
+     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
+     case VK_DRIVER_ID_AMD_PROPRIETARY:
+         return true;
++#if defined(__linux__) && !defined(__ANDROID__)
++    // Linux build patch: Mesa's drivers (RADV on the Steam Deck and AMD, ANV on Intel, NVK) keep
++    // their own shader cache on disk, like NVIDIA's and AMD's Windows drivers. Prepared pipelines
++    // go there; otherwise they piled up in the emulator's pipeline cache, which is held in memory
++    // and filled 32 GB of RAM and swap before OoT's ~120,000 pipelines were done (issue #6).
++    // Unless the player turned Mesa's cache off (MESA_SHADER_CACHE_DISABLE).
++    case VK_DRIVER_ID_MESA_RADV:
++    case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA:
++    case VK_DRIVER_ID_MESA_NVK: {
++        const char* disable = std::getenv("MESA_SHADER_CACHE_DISABLE");
++        return disable == nullptr || std::string_view{disable} == "false" ||
++               std::string_view{disable} == "0";
++    }
++#endif
+     default:
+         return false;
+     }
+diff --git a/src/yuzu/main.cpp b/src/yuzu/main.cpp
+index f244c432c9..5abf3a59d9 100644
+--- a/src/yuzu/main.cpp
++++ b/src/yuzu/main.cpp
+@@ -255,6 +255,13 @@ int main(int argc, char* argv[]) {
+             qputenv("__GL_SHADER_DISK_CACHE_SIZE", "10737418240"); // 10 GiB
+         }
+     }
++#if defined(__linux__) && !defined(__ANDROID__)
++    // Linux build patch: the same for Mesa's drivers (AMD, Intel, the Steam Deck), whose shader
++    // cache is 1 GB by default; prepared pipelines go there (issue #6).
++    if (!qEnvironmentVariableIsSet("MESA_SHADER_CACHE_MAX_SIZE")) {
++        qputenv("MESA_SHADER_CACHE_MAX_SIZE", "10G");
++    }
++#endif
+ #if YUZU_ROOM
+     bool launch_room = false;
+     for (int i = 1; i < argc; i++) {
