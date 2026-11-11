@@ -1,8 +1,8 @@
 diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
-index c4093d5474..921af37b8d 100644
+index bf83c1b..bcc8a75 100644
 --- a/src/video_core/CMakeLists.txt
 +++ b/src/video_core/CMakeLists.txt
-@@ -597,4 +597,23 @@ if (ENABLE_NVIDIA_DLSS)
+@@ -638,4 +638,23 @@ if (ENABLE_NVIDIA_DLSS)
      message(STATUS "NVIDIA DLSS through Streamline: ${STREAMLINE_INCLUDE_DIR}")
  endif()
  
@@ -27,26 +27,26 @@ index c4093d5474..921af37b8d 100644
 +
  create_target_directory_groups(video_core)
 diff --git a/src/video_core/renderer_vulkan/vk_ocarina_camera_motion.cpp b/src/video_core/renderer_vulkan/vk_ocarina_camera_motion.cpp
-index ecde60dea3..df483f4a31 100644
+index de1a0ab..e33a232 100644
 --- a/src/video_core/renderer_vulkan/vk_ocarina_camera_motion.cpp
 +++ b/src/video_core/renderer_vulkan/vk_ocarina_camera_motion.cpp
-@@ -6,6 +6,10 @@
- #include <cstring>
- 
+@@ -22,6 +22,10 @@
+ #include "video_core/host_shaders/ocarina_dlss_effects_comp_spv.h"
+ #include "video_core/renderer_vulkan/vk_master_semaphore.h"
  #ifdef EGLANTINE_STREAMLINE
 +#include "video_core/vulkan_common/vulkan.h"
 +// Linux build patch: X11 defines (as in present/layer.cpp), which nvdrv's NvResult uses.
 +#undef Success
 +#undef BadValue
- #include "common/logging.h"
- #include "video_core/host_shaders/ocarina_dlss_color_comp_spv.h"
- #include "video_core/host_shaders/ocarina_dlss_output_comp_spv.h"
+ #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
+ #include "video_core/vulkan_common/streamline.h"
+ #endif
 diff --git a/src/video_core/renderer_vulkan/vk_streamline_dlss_linux.cpp b/src/video_core/renderer_vulkan/vk_streamline_dlss_linux.cpp
 new file mode 100644
-index 0000000000..19d9a65ede
+index 0000000..78165b9
 --- /dev/null
 +++ b/src/video_core/renderer_vulkan/vk_streamline_dlss_linux.cpp
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,436 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -55,11 +55,15 @@ index 0000000000..19d9a65ede
 +// does the same through NVIDIA Streamline.
 +
 +#include <array>
++#include <atomic>
 +#include <cstdlib>
++#include <optional>
 +#include <string_view>
 +
 +#include "common/logging.h"
 +#include "common/settings.h"
++#include "video_core/dlss_mode.h"
++#include "video_core/renderer_base.h"
 +#include "video_core/renderer_vulkan/vk_scheduler.h"
 +#include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 +#include "video_core/vulkan_common/streamline.h"
@@ -97,26 +101,30 @@ index 0000000000..19d9a65ede
 +    return value ? std::atoi(value) : fallback;
 +}
 +
-+// DLSS validates the render size against the mode's range: pick the mode for this ratio.
-+int32_t QualityFor(VkExtent2D render, VkExtent2D upscale) {
-+    const f32 ratio = static_cast<f32>(render.width) / static_cast<f32>(upscale.width);
-+    if (ratio >= 0.99f) {
++std::atomic<u64> evaluations{};
++std::atomic<u32> last_evaluation{}; ///< Mode, requested mode and preset, a byte each
++
++int32_t QualityValue(Settings::NvidiaDlssQuality mode) {
++    using Quality = Settings::NvidiaDlssQuality;
++    switch (mode) {
++    case Quality::Native:
 +        return QUALITY_DLAA;
-+    }
-+    if (ratio >= 0.65f) {
++    case Quality::Quality:
 +        return QUALITY_QUALITY;
-+    }
-+    if (ratio >= 0.57f) {
++    case Quality::Balanced:
 +        return QUALITY_BALANCED;
-+    }
-+    if (ratio >= 0.49f) {
++    case Quality::Performance:
 +        return QUALITY_PERFORMANCE;
++    case Quality::UltraPerformance:
++        return QUALITY_ULTRA_PERFORMANCE;
++    case Quality::Automatic:
++        break;
 +    }
-+    return QUALITY_ULTRA_PERFORMANCE;
++    return QUALITY_QUALITY;
 +}
 +
-+// As on Windows: preset K unless EDEN_NX2_DLSS_PRESET or Graphics > DLSS preset say otherwise.
-+uint32_t Preset() {
++// As on Windows: Graphics > DLSS preset, K by default; EDEN_NX2_DLSS_PRESET=J|K|L|M|default wins.
++uint32_t PresetFor(Settings::DlssPreset preset) {
 +    const char* const value = std::getenv("EDEN_NX2_DLSS_PRESET");
 +    if (value && value[0] >= 'J' && value[0] <= 'M') {
 +        return PRESET_J + static_cast<uint32_t>(value[0] - 'J');
@@ -124,7 +132,7 @@ index 0000000000..19d9a65ede
 +    if (value && std::string_view{value} == "default") {
 +        return PRESET_DEFAULT;
 +    }
-+    switch (Settings::values.nvidia_dlss_preset.GetValue()) {
++    switch (preset) {
 +    case Settings::DlssPreset::Default:
 +        return PRESET_DEFAULT;
 +    case Settings::DlssPreset::J:
@@ -134,9 +142,9 @@ index 0000000000..19d9a65ede
 +    case Settings::DlssPreset::M:
 +        return PRESET_M;
 +    case Settings::DlssPreset::K:
-+    default:
-+        return PRESET_K;
++        break;
 +    }
++    return PRESET_K;
 +}
 +
 +VkImageMemoryBarrier Barrier(const StreamlineDlssUpscaler::Image& image, VkAccessFlags src_access,
@@ -177,7 +185,7 @@ index 0000000000..19d9a65ede
 +    if (!Streamline::IsDlssAvailable()) {
 +        throw vk::Exception(VK_ERROR_FEATURE_NOT_PRESENT);
 +    }
-+    point_sampler = device.GetLogical().CreateSampler(VkSamplerCreateInfo{
++    VkSamplerCreateInfo sampler_info{
 +        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
 +        .pNext = nullptr,
 +        .flags = 0,
@@ -196,7 +204,11 @@ index 0000000000..19d9a65ede
 +        .maxLod = VK_LOD_CLAMP_NONE,
 +        .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
 +        .unnormalizedCoordinates = VK_FALSE,
-+    });
++    };
++    point_sampler = device.GetLogical().CreateSampler(sampler_info);
++    sampler_info.magFilter = VK_FILTER_LINEAR;
++    sampler_info.minFilter = VK_FILTER_LINEAR;
++    linear_sampler = device.GetLogical().CreateSampler(sampler_info);
 +}
 +
 +StreamlineDlssUpscaler::~StreamlineDlssUpscaler() {
@@ -274,14 +286,22 @@ index 0000000000..19d9a65ede
 +                                in.render_size.height != render_extent.height ||
 +                                in.upscale_size.width != upscale_extent.width ||
 +                                in.upscale_size.height != upscale_extent.height;
-+    const bool options_changed = extent_changed || in.hdr != hdr_input;
++    const auto settings = Settings::GetNvidiaDlssRuntimeSettings();
++    const bool options_changed = extent_changed || in.hdr != hdr_input ||
++                                 quality_mode != settings.quality ||
++                                 model_preset != settings.preset;
 +    const bool reset = in.reset || options_changed;
++    if (options_changed && !extent_changed) {
++        scheduler.Finish();
++    }
 +    if (extent_changed) {
 +        CreateOutput(in.upscale_size);
 +        render_extent = in.render_size;
 +        upscale_extent = in.upscale_size;
 +    }
 +    hdr_input = in.hdr;
++    quality_mode = settings.quality;
++    model_preset = settings.preset;
 +
 +    FdbEvaluate evaluate{};
 +    evaluate.color = BridgeImage(in.color, in.render_size);
@@ -305,8 +325,7 @@ index 0000000000..19d9a65ede
 +    evaluate.render_height = in.render_size.height;
 +    evaluate.output_width = in.upscale_size.width;
 +    evaluate.output_height = in.upscale_size.height;
-+    evaluate.quality = QualityFor(in.render_size, in.upscale_size);
-+    evaluate.preset = Preset();
++    evaluate.preset = PresetFor(settings.preset);
 +    evaluate.create_flags = FLAG_MV_LOW_RES;
 +    if (in.depth_inverted) {
 +        evaluate.create_flags |= FLAG_DEPTH_INVERTED;
@@ -322,16 +341,57 @@ index 0000000000..19d9a65ede
 +    evaluate.mv_scale_x = in.motion_vector_scale[0];
 +    evaluate.mv_scale_y = in.motion_vector_scale[1];
 +    evaluate.reset = reset ? 1 : 0;
-+    if (options_changed) {
-+        LOG_INFO(Render_Vulkan, "NVIDIA DLSS (NGX): {}x{} -> {}x{}, quality {}, preset {}, {}",
-+                 in.render_size.width, in.render_size.height, in.upscale_size.width,
-+                 in.upscale_size.height, evaluate.quality, evaluate.preset,
-+                 (evaluate.create_flags & FLAG_HDR) != 0 ? "HDR" : "LDR");
-+    }
-+
 +    scheduler.RequestOutsideRenderPassOperationContext();
-+    scheduler.Record([this, in, evaluate, output_image_handle = *output_image](
-+                         vk::CommandBuffer cmdbuf) {
++    scheduler.Record([this, in, evaluate, options_changed, requested = settings.quality,
++                      preset_setting = settings.preset,
++                      output_image_handle = *output_image](vk::CommandBuffer cmdbuf) {
++        const Streamline::Bridge& bridge = Streamline::GetBridge();
++        // The DLSS mode: the one asked for when it accepts this render size, as on Windows.
++        bool mode_ok = true;
++        if (options_changed) {
++            namespace Mode = VideoCommon::DlssMode;
++            const auto selection = Mode::Select(
++                requested, {in.render_size.width, in.render_size.height},
++                {in.upscale_size.width, in.upscale_size.height},
++                [&](Settings::NvidiaDlssQuality mode) -> std::optional<Mode::Range> {
++                    Mode::Range range{};
++                    if (!bridge.render_size_range(in.upscale_size.width, in.upscale_size.height,
++                                                  QualityValue(mode), &range.min.width,
++                                                  &range.min.height, &range.max.width,
++                                                  &range.max.height)) {
++                        return std::nullopt;
++                    }
++                    return range;
++                });
++            if (selection.fallback) {
++                const Mode::Range range = selection.requested_range.value_or(Mode::Range{});
++                LOG_WARNING(Render_Vulkan,
++                            "NVIDIA DLSS requested {} but using {} for {}x{} -> {}x{}; requested "
++                            "range {}x{} to {}x{} (query {})",
++                            Settings::CanonicalizeEnum(requested),
++                            selection.mode ? Settings::CanonicalizeEnum(*selection.mode)
++                                           : "FSR 3.1",
++                            in.render_size.width, in.render_size.height, in.upscale_size.width,
++                            in.upscale_size.height, range.min.width, range.min.height,
++                            range.max.width, range.max.height,
++                            selection.requested_range ? "supported" : "unavailable");
++            }
++            if (selection.mode) {
++                evaluated_mode = *selection.mode;
++                LOG_INFO(Render_Vulkan, "NVIDIA DLSS (NGX): {}x{} -> {}x{}, mode {}, preset {}, {}",
++                         in.render_size.width, in.render_size.height, in.upscale_size.width,
++                         in.upscale_size.height, Settings::CanonicalizeEnum(*selection.mode),
++                         evaluate.preset,
++                         (evaluate.create_flags & FLAG_HDR) != 0 ? "HDR" : "LDR");
++            } else {
++                LOG_WARNING(Render_Vulkan, "No NVIDIA DLSS mode accepts {}x{} -> {}x{}",
++                            in.render_size.width, in.render_size.height, in.upscale_size.width,
++                            in.upscale_size.height);
++                mode_ok = false;
++            }
++        }
++        FdbEvaluate frame = evaluate;
++        frame.quality = QualityValue(evaluated_mode);
 +        constexpr VkAccessFlags WRITES =
 +            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
 +            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -359,12 +419,16 @@ index 0000000000..19d9a65ede
 +        };
 +        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
 +                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, to_read);
-+        const Streamline::Bridge& bridge = Streamline::GetBridge();
-+        const bool evaluated = bridge.evaluate(*cmdbuf, &evaluate) != 0;
++        const bool evaluated = mode_ok && bridge.evaluate(*cmdbuf, &frame) != 0;
 +        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 +                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, output_written, {},
 +                               to_general);
 +        if (evaluated) {
++            last_evaluation.store(static_cast<u32>(evaluated_mode) |
++                                      (static_cast<u32>(requested) << 8) |
++                                      (static_cast<u32>(preset_setting) << 16),
++                                  std::memory_order_relaxed);
++            evaluations.fetch_add(1, std::memory_order_release);
 +            return;
 +        }
 +        if (!failed.exchange(true)) {
@@ -407,13 +471,24 @@ index 0000000000..19d9a65ede
 +    return true;
 +}
 +
++VideoCore::DlssStatus StreamlineDlssUpscaler::Status() {
++    const u64 count = evaluations.load(std::memory_order_acquire);
++    const u32 last = last_evaluation.load(std::memory_order_relaxed);
++    return {
++        .evaluations = count,
++        .mode = static_cast<Settings::NvidiaDlssQuality>(last & 0xff),
++        .requested = static_cast<Settings::NvidiaDlssQuality>((last >> 8) & 0xff),
++        .preset = static_cast<Settings::DlssPreset>((last >> 16) & 0xff),
++    };
++}
++
 +} // namespace Vulkan
 diff --git a/src/video_core/vulkan_common/fritchii_dlss_bridge.h b/src/video_core/vulkan_common/fritchii_dlss_bridge.h
 new file mode 100644
-index 0000000000..16ffa8d402
+index 0000000..ac77136
 --- /dev/null
 +++ b/src/video_core/vulkan_common/fritchii_dlss_bridge.h
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,87 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Fritchii-linux contributors
 +// SPDX-License-Identifier: MIT
 +
@@ -432,7 +507,7 @@ index 0000000000..16ffa8d402
 +extern "C" {
 +#endif
 +
-+#define FDB_ABI_VERSION 1u
++#define FDB_ABI_VERSION 2u
 +
 +typedef struct FdbImage {
 +    VkImageView view;
@@ -482,6 +557,12 @@ index 0000000000..16ffa8d402
 +             PFN_vkGetDeviceProcAddr get_device_proc_addr, const char* data_dir_utf8,
 +             const char* model_dir_utf8, FdbLogFn log);
 +
++/// The render sizes DLSS accepts for an output size in a quality mode (see FdbEvaluate::quality).
++/// Returns 1 on success.
++int fdb_render_size_range(uint32_t output_width, uint32_t output_height, int32_t quality,
++                          uint32_t* min_width, uint32_t* min_height, uint32_t* max_width,
++                          uint32_t* max_height);
++
 +/// Records one DLSS evaluation (creating or recreating the DLSS feature when its settings change).
 +/// Returns 1 on success.
 +int fdb_evaluate(VkCommandBuffer command_buffer, const FdbEvaluate* evaluate);
@@ -497,10 +578,10 @@ index 0000000000..16ffa8d402
 +#endif
 diff --git a/src/video_core/vulkan_common/streamline_linux.cpp b/src/video_core/vulkan_common/streamline_linux.cpp
 new file mode 100644
-index 0000000000..d8c11a55a0
+index 0000000..e1bbac4
 --- /dev/null
 +++ b/src/video_core/vulkan_common/streamline_linux.cpp
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,245 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -634,6 +715,7 @@ index 0000000000..d8c11a55a0
 +    const bool resolved = Resolve(module, bridge.abi_version, "fdb_abi_version") &&
 +                          Resolve(module, bridge.required_extensions, "fdb_required_extensions") &&
 +                          Resolve(module, bridge.init, "fdb_init") &&
++                          Resolve(module, bridge.render_size_range, "fdb_render_size_range") &&
 +                          Resolve(module, bridge.evaluate, "fdb_evaluate") &&
 +                          Resolve(module, bridge.shutdown, "fdb_shutdown") &&
 +                          Resolve(module, bridge.last_error, "fdb_last_error");
@@ -747,10 +829,10 @@ index 0000000000..d8c11a55a0
 +} // namespace Vulkan::Streamline
 diff --git a/src/video_core/vulkan_common/streamline_linux.h b/src/video_core/vulkan_common/streamline_linux.h
 new file mode 100644
-index 0000000000..304783093e
+index 0000000..7e2866f
 --- /dev/null
 +++ b/src/video_core/vulkan_common/streamline_linux.h
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,30 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -768,6 +850,7 @@ index 0000000000..304783093e
 +    decltype(&fdb_abi_version) abi_version{};
 +    decltype(&fdb_required_extensions) required_extensions{};
 +    decltype(&fdb_init) init{};
++    decltype(&fdb_render_size_range) render_size_range{};
 +    decltype(&fdb_evaluate) evaluate{};
 +    decltype(&fdb_shutdown) shutdown{};
 +    decltype(&fdb_last_error) last_error{};
@@ -781,11 +864,11 @@ index 0000000000..304783093e
 +
 +} // namespace Vulkan::Streamline
 diff --git a/src/yuzu/CMakeLists.txt b/src/yuzu/CMakeLists.txt
-index 0a3d33862e..69962d3826 100644
+index 3528b26..41d0d81 100644
 --- a/src/yuzu/CMakeLists.txt
 +++ b/src/yuzu/CMakeLists.txt
-@@ -76,6 +76,7 @@ add_executable(yuzu
-     configuration/configure_graphics.h
+@@ -78,6 +78,7 @@ add_executable(yuzu
+     configuration/amd_fsr4_panel.h
      configuration/nvidia_dlss_panel.cpp
      configuration/nvidia_dlss_panel.h
 +    configuration/nvidia_dlss_panel_linux.cpp
@@ -793,16 +876,17 @@ index 0a3d33862e..69962d3826 100644
      configuration/configure_graphics_advanced.cpp
      configuration/configure_graphics_advanced.h
 diff --git a/src/yuzu/configuration/configure_graphics.cpp b/src/yuzu/configuration/configure_graphics.cpp
-index 2d336f63f2..00dd728e6c 100644
+index 36ba1f3..e9e7405 100644
 --- a/src/yuzu/configuration/configure_graphics.cpp
 +++ b/src/yuzu/configuration/configure_graphics.cpp
-@@ -234,6 +234,14 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
+@@ -239,6 +239,15 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
              continue;
          }
  #endif
 +#ifdef EGLANTINE_DLSS_BRIDGE
 +        // Linux build patch: NVIDIA DLSS needs NVIDIA's own driver.
 +        if ((setting->Id() == Settings::values.nvidia_dlss.Id() ||
++             setting->Id() == Settings::values.nvidia_dlss_quality.Id() ||
 +             setting->Id() == Settings::values.nvidia_dlss_preset.Id()) &&
 +            !NvidiaDlssPanel::HasNvidiaDriver()) {
 +            continue;
@@ -811,7 +895,7 @@ index 2d336f63f2..00dd728e6c 100644
  
          ConfigurationShared::Widget* widget = [&]() {
              if (setting->Id() == Settings::values.fsr_sharpening_slider.Id()) {
-@@ -331,7 +339,14 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
+@@ -342,7 +351,15 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
  
              hold_graphics.emplace(setting->Id(), widget);
  #endif
@@ -819,16 +903,17 @@ index 2d336f63f2..00dd728e6c 100644
 +#ifdef EGLANTINE_DLSS_BRIDGE
 +        } else if (setting->Id() == Settings::values.nvidia_dlss.Id()) {
 +            // Linux build patch: "Install DLSS" next to the checkbox.
++            nvidia_dlss_checkbox = widget->checkbox;
 +            NvidiaDlssPanel* panel = new NvidiaDlssPanel(widget, widget->checkbox);
 +            QBoxLayout* row = qobject_cast<QBoxLayout*>(widget->layout());
 +            row->insertWidget(1, panel);
 +            hold_graphics.emplace(setting->Id(), widget);
 +#elif defined(EGLANTINE_STREAMLINE)
          } else if (setting->Id() == Settings::values.nvidia_dlss.Id()) {
+             nvidia_dlss_checkbox = widget->checkbox;
              // NVIDIA's files and a download button under the checkbox.
-             QWidget* group = new QWidget(this);
 diff --git a/src/yuzu/configuration/nvidia_dlss_panel.cpp b/src/yuzu/configuration/nvidia_dlss_panel.cpp
-index fac8132902..7705770864 100644
+index 45a2504..01dce62 100644
 --- a/src/yuzu/configuration/nvidia_dlss_panel.cpp
 +++ b/src/yuzu/configuration/nvidia_dlss_panel.cpp
 @@ -1,7 +1,7 @@
@@ -841,7 +926,7 @@ index fac8132902..7705770864 100644
  #include "common/httplib.h"
  
 diff --git a/src/yuzu/configuration/nvidia_dlss_panel.h b/src/yuzu/configuration/nvidia_dlss_panel.h
-index 1ab39178eb..5589f5e58a 100644
+index 1ab3917..5589f5e 100644
 --- a/src/yuzu/configuration/nvidia_dlss_panel.h
 +++ b/src/yuzu/configuration/nvidia_dlss_panel.h
 @@ -6,7 +6,7 @@
@@ -893,7 +978,7 @@ index 1ab39178eb..5589f5e58a 100644
  #endif
 diff --git a/src/yuzu/configuration/nvidia_dlss_panel_linux.cpp b/src/yuzu/configuration/nvidia_dlss_panel_linux.cpp
 new file mode 100644
-index 0000000000..e7d12a8ea7
+index 0000000..e7d12a8
 --- /dev/null
 +++ b/src/yuzu/configuration/nvidia_dlss_panel_linux.cpp
 @@ -0,0 +1,426 @@
