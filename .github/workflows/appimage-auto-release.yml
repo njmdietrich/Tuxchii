@@ -214,6 +214,13 @@ jobs:
             extra="${extra:+$extra, }$name"
           done
           echo "EXTRA_PATCHES=$extra" >> "$GITHUB_ENV"
+          # 7. Tuxchii branding: the app's name in every window and dialog. Internal names (data
+          #    folders, settings keys, environment variables) are unchanged, so existing data works.
+          b=_linux-patches/.github/linux-patches/tuxchii-branding.py
+          if [ -f "$b" ]; then
+            python3 "$b" . | tail -n 60
+            echo "TUXCHII_BRANDING=1" >> "$GITHUB_ENV"
+          fi
           git diff --stat
 
       - name: Configure
@@ -408,6 +415,9 @@ jobs:
               bullets += (f"- **Your shader cache comes along:** v5.8 moved Fritchii's folders from `eden` to `fritchii` and copies settings, saves and keys, "
                           f"but not caches. This build also copies each game's shader cache from `~/.cache/eden` (or Lichii's) to `~/.cache/fritchii` once, "
                           f"so games don't start stuttering again ([patch]({link('shader-cache-import.patch')}))\n")
+          if os.environ.get("TUXCHII_BRANDING") == "1":
+              bullets += (f"- **Tuxchii name** in every window and dialog. Data folders, settings and saves are unchanged, "
+                          f"so nothing moves ([script]({link('tuxchii-branding.py')}))\n")
           if "steam-deck-test.patch" in applied:
               bullets += (f"- **Prepare Shaders on AMD and Intel (Steam Deck too):** upstream only prepares shaders on NVIDIA; Mesa drivers (RADV, ANV, NVK) "
                           f"now get them as well, the classic interface shows the \"Preparing shaders\" screen, and a Steam Deck switches to handheld mode once "
