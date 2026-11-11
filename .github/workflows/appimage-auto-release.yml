@@ -44,6 +44,563 @@ jobs:
     outputs:
       tags: ${{ steps.find.outputs.tags }}
       newest: ${{ steps.find.outputs.newest }}
+      latest: ${{ steps.find.outputs.latest }}
+      build: ${{ steps.find.outputs.build }}
+    steps:
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+          TEST_BUILD: ${{ github.ref_name != 'nx2' }}
+        run: |
+          set -euo pipefail
+          # Published (non-draft) upstream releases whose tag starts with TAG_PREFIX, newest first.
+          mapfile -t releases < <(gh api "repos/$UPSTREAM/releases?per_page=50" --jq \
+            "[.[] | select(.draft | not) | select(.tag_name | startswith(\"$TAG_PREFIX\"))]
+             | sort_by(.published_at) | reverse | .[].tag_name")
+          all_newest="${releases[0]:-}"
+          # Only x and x.y versions build on their own; x.y.z patch releases are skipped (the user's
+          # choice, 2026-11-10). Build one by entering its tag in "Run workflow".
+          mapfile -t releases < <(printf '%s\n' "${releases[@]}" | grep -E "^${TAG_PREFIX}v[0-9]+(\.[0-9]+)?$" || true)
+          newest="${releases[0]:-}"
+          echo "newest=$newest" >> "$GITHUB_OUTPUT"
+          # "Latest" (what the updater and AppImage update tools follow): the newest x/x.y version, or a
+          # patch release entered by hand when it is Fritchii's newest release overall.
+          latest="$newest"
+          if [ -n "${INPUT_TAG:-}" ] && [ "$INPUT_TAG" = "$all_newest" ]; then latest="$INPUT_TAG"; fi
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          if [ -n "${INPUT_TAG:-}" ]; then
+            candidates=("$INPUT_TAG")
+          elif [ "$TEST_BUILD" = "true" ]; then
+            candidates=("$newest") # a test build: just the newest version
+          else
+            candidates=("${releases[@]:0:$BACKFILL}")
+          fi
+          missing=()
+          for tag in "${candidates[@]}"; do
+            if [ "$TEST_BUILD" != "true" ] && [ "${FORCE:-false}" != "true" ] &&
+               gh release view "appimage-$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "appimage-$tag already published"
+            else
+              echo "Will build $tag"; missing+=("$tag")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "tags=$(jq -cn '$ARGS.positional' --args "${missing[@]}")" >> "$GITHUB_OUTPUT"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo 'tags=["none"]' >> "$GITHUB_OUTPUT" # placeholder; the build job is skipped
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ matrix.tag }} AppImage
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.check.outputs.tags) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    permissions:
+      contents: write
+    concurrency:
+      group: appimage-${{ matrix.tag }}
+      cancel-in-progress: false
+    env:
+      TAG: ${{ matrix.tag }}
+      # Only the newest upstream version gets GitHub's "Latest" label, so building an older
+      # version never takes it away from the current one.
+      LATEST: ${{ matrix.tag == needs.check.outputs.latest }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 3000M
+      CCACHE_COMPILERCHECK: content
+    steps:
+      - name: Check out upstream source at ${{ matrix.tag }}
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ matrix.tag }}
+          submodules: recursive
+
+      # This repo's own patch files (.github/linux-patches), checked out beside the source.
+      - name: Check out Linux patches
+        uses: actions/checkout@v5
+        with:
+          path: _linux-patches
+          sparse-checkout: .github/linux-patches
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential make perl libssl-dev autoconf g++ gcc git glslang-tools libglu1-mesa-dev zsync \
+            libpulse-dev libtool libudev-dev libxkbcommon-x11-0 \
+            mesa-common-dev nasm ninja-build qt6-base-private-dev \
+            qt6-charts-dev qt6-tools-dev libavfilter-dev libavcodec-dev \
+            libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
+            spirv-tools spirv-headers libusb-1.0-0-dev \
+            libboost-dev libboost-fiber-dev libboost-context-dev \
+            libopus-dev libasound2-dev ccache file python3-venv \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+          # The source needs CMake >= 3.31; take the newest from PyPI.
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q --upgrade cmake
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      # Fritchii's Linux PGO build: clang from apt.llvm.org (Ubuntu's clang 18 can't read the profile),
+      # with the profile in the source tree. Without a profile the build stays on GCC.
+      - name: Install clang for PGO
+        run: |
+          if [ ! -s eglantine.profdata ]; then echo "No eglantine.profdata: GCC build"; exit 0; fi
+          curl -fsSL --retry 5 https://apt.llvm.org/llvm-snapshot.gpg.key |
+            sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-$PGO_LLVM_VERSION main" |
+            sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "clang-$PGO_LLVM_VERSION" "lld-$PGO_LLVM_VERSION"
+          "clang-$PGO_LLVM_VERSION" --version
+          echo "PGO_BUILD=1" >> "$GITHUB_ENV"
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          modules: qtcharts qtwaylandcompositor
+          cache: true
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .ccache
+          key: ccache-appimage-${{ matrix.tag }}-${{ github.run_id }}
+          restore-keys: ccache-appimage-
+
+      # Upstream only builds for Windows, so a few things break on Linux. Each patch is applied only
+      # where its pattern is present, so a release that fixes it upstream just skips the patch.
+      - name: Apply Linux build patches
+        run: |
+          # 1. X11's Xlib.h does "#define Status int", which breaks VideoCommon's Status enum.
+          f=src/video_core/vulkan_common/vulkan.h
+          grep -q '^#undef Status' "$f" || sed -i 's/^#undef True$/#undef True\n#undef Status/' "$f"
+          grep -q '^#undef Status' "$f" || { echo "::error::could not patch $f"; exit 1; }
+          # 2. v5: CommitAllBut logs g_committed_bytes, which only exists in the Windows build.
+          f=src/common/host_memory.cpp
+          if grep -qF 'g_committed_bytes.load(std::memory_order_relaxed) >> 20);' "$f"; then
+            sed -i 's/g_committed_bytes\.load(std::memory_order_relaxed) >> 20);/GetCommitStats().committed_bytes >> 20);/' "$f"
+            echo "patched $f"
+          fi
+          # 3. v5: nx2_precompile.cpp calls Common::FS::GetExeDirectory(), which only exists on
+          #    Windows. Add a Linux version (directory of /proc/self/exe), unless upstream has one.
+          h=src/common/fs/path_util.h; c=src/common/fs/path_util.cpp
+          if [ "$(grep -c 'GetExeDirectory();' "$h")" = 1 ] && [ "$(grep -c 'path GetExeDirectory()' "$c")" = 1 ]; then
+            sed -i 's|^} // namespace Common::FS$|#ifndef _WIN32\n[[nodiscard]] std::filesystem::path GetExeDirectory(); // Linux build patch\n#endif\n\n} // namespace Common::FS|' "$h"
+            sed -i 's|^} // namespace Common::FS$|#ifndef _WIN32\nfs::path GetExeDirectory() { // Linux build patch\n    std::error_code ec;\n    if (auto exe = fs::read_symlink("/proc/self/exe", ec); !ec) {\n        return exe.parent_path();\n    }\n    return fs::current_path(ec);\n}\n#endif\n\n} // namespace Common::FS|' "$c"
+            echo "patched GetExeDirectory for Linux"
+          fi
+          # 5. v5.5: main() sets NVIDIA's shader disk cache size (10 GiB) only "if (FritchiiUi::Enabled())".
+          #    That runs before the settings file is read, so with the classic-UI patch it would never
+          #    run here. Upstream always runs it in Fritchii builds: keep it independent of the interface.
+          f=src/yuzu/main.cpp
+          if grep -q '__GL_SHADER_DISK_CACHE_SKIP_CLEANUP' "$f"; then
+            sed -i '/^    if (FritchiiUi::Enabled()) {$/{N;s|^    if (FritchiiUi::Enabled()) {\n\(\s*if (!qEnvironmentVariableIsSet("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"))\)|    { // Linux build patch: not tied to the interface choice\n\1|}' "$f"
+            grep -q 'Linux build patch: not tied to the interface choice' "$f" && echo "patched NVIDIA shader cache size for Linux"
+          fi
+          # 4. Classic UI by default, with "Use the Fritchii interface" in Settings > UI.
+          #    Only for versions that have Fritchii's own interface (v5 and later).
+          p=_linux-patches/.github/linux-patches/classic-ui-setting.patch
+          if [ -f src/yuzu/fritchii/fritchii_ui.cpp ]; then
+            git apply --check "$p" || git apply --check -C1 "$p" ||
+              { echo "::error::classic-ui-setting.patch no longer applies to $TAG; it needs updating"; exit 1; }
+            git apply "$p" 2>/dev/null || git apply -C1 "$p"
+            echo "applied classic-ui-setting.patch"
+            echo "CLASSIC_UI_DEFAULT=1" >> "$GITHUB_ENV"
+          fi
+          # 6. Any other .patch files on this branch (test fixes on a testing branch), in name order.
+          extra=""
+          for p in _linux-patches/.github/linux-patches/*.patch; do
+            name=$(basename "$p")
+            [ -e "$p" ] && [ "$name" != classic-ui-setting.patch ] || continue
+            git apply --check "$p" || { echo "::error::$name does not apply to $TAG"; exit 1; }
+            git apply "$p"
+            echo "applied $name"
+            extra="${extra:+$extra, }$name"
+          done
+          echo "EXTRA_PATCHES=$extra" >> "$GITHUB_ENV"
+          # 7. Tuxchii branding: the app's name in every window and dialog. Internal names (data
+          #    folders, settings keys, environment variables) are unchanged, so existing data works.
+          # 8. What the Tuxchii updater (tuxchii-updater.patch) compares with GitHub: release builds carry
+          #    their workflow run number; test builds 0, so any release of the same version is newer.
+          build_number=0; [ "$GITHUB_REF_NAME" = nx2 ] && build_number="$GITHUB_RUN_NUMBER"
+          printf '#pragma once\n#define TUXCHII_REPO "%s"\n#define TUXCHII_BUILD_NUMBER %s\n' \
+            "$GITHUB_REPOSITORY" "$build_number" > src/yuzu/tuxchii_build.h
+          echo "TUXCHII_BUILD_NUMBER=$build_number" >> "$GITHUB_ENV"
+          b=_linux-patches/.github/linux-patches/tuxchii-branding.py
+          if [ -f "$b" ]; then
+            python3 "$b" . | tail -n 60
+            echo "TUXCHII_BRANDING=1" >> "$GITHUB_ENV"
+          fi
+          git diff --stat
+
+      - name: Configure
+        run: |
+          cmake --version | head -1
+          # The same compiler and flags as Fritchii's Linux PGO job, when its profile is there.
+          pgo=()
+          if [ "${PGO_BUILD:-0}" = 1 ]; then
+            profile="-fprofile-use=$PWD/eglantine.profdata -Wno-backend-plugin -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
+            pgo=("-DCMAKE_C_COMPILER=clang-$PGO_LLVM_VERSION" "-DCMAKE_CXX_COMPILER=clang++-$PGO_LLVM_VERSION"
+                 "-DCMAKE_EXE_LINKER_FLAGS=-B/usr/lib/llvm-$PGO_LLVM_VERSION/bin -fuse-ld=lld"
+                 "-DCMAKE_C_FLAGS=$profile" "-DCMAKE_CXX_FLAGS=$profile")
+          fi
+          cmake -S . -B build/release -G Ninja "${pgo[@]}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF -DYUZU_TESTS=OFF \
+            -DYUZU_CMD=ON -DYUZU_ROOM=OFF -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR" \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DVulkanHeaders_FORCE_BUNDLED=ON -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+            -DENABLE_UPDATE_CHECKER=ON \
+            -DLICHII_BUILD_TAG="$TAG" -DLICHII_BUILD_PLATFORM=linux-x86_64 \
+            -DUSE_DISCORD_PRESENCE=OFF -DUSE_CCACHE=ON \
+            -DENABLE_WERROR=OFF -DYUZU_USE_BUNDLED_OPENSSL=OFF
+
+      - name: Build
+        run: |
+          cmake --build build/release --target yuzu yuzu-cmd --parallel
+          strip build/release/bin/lichii build/release/bin/eden-cli
+          ccache -s || true
+
+      # Saved even when the build fails, so a re-run picks up where it stopped.
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: .ccache
+          key: ccache-appimage-${{ matrix.tag }}-${{ github.run_id }}
+
+      - name: Package AppImage
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/linuxdeploy"; mkdir -p "$tools"
+          curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o "$tools/linuxdeploy-x86_64.AppImage" \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o "$tools/linuxdeploy-plugin-qt-x86_64.AppImage" \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x "$tools"/*.AppImage
+          icon="$RUNNER_TEMP/io.github.zortos293.lichii.png"
+          cp dist/lichii.png "$icon"
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export QMAKE="$QT_ROOT_DIR/bin/qmake"
+          export EXTRA_QT_MODULES=waylandcompositor
+          export EXTRA_PLATFORM_PLUGINS='libqwayland-egl.so;libqwayland-generic.so'
+          export LINUXDEPLOY_OUTPUT_VERSION="$TAG"
+          export LDAI_OUTPUT="Tuxchii-${TAG#$TAG_PREFIX}-x86_64.AppImage"
+          export OUTPUT="$LDAI_OUTPUT" ARCH=x86_64
+          # Releases: AppImage update information, so AppImageUpdate, Gear Lever and AppImageLauncher
+          # can update it from this repo's latest release (with the .zsync file published beside it).
+          if [ "$GITHUB_REF_NAME" = nx2 ]; then
+            export LDAI_UPDATE_INFORMATION="gh-releases-zsync|${GITHUB_REPOSITORY%%/*}|${GITHUB_REPOSITORY#*/}|latest|Tuxchii-*x86_64.AppImage.zsync"
+            export UPDATE_INFORMATION="$LDAI_UPDATE_INFORMATION"
+          fi
+          # NVIDIA DLSS (when the DLSS patch is applied): the MIT-licensed Fritchii DLSS bridge as an
+          # object file and the mold linker (MIT), so Settings > Graphics > Install DLSS can link the
+          # bridge with NVIDIA's SDK files on the user's PC. Nothing of NVIDIA's is in the AppImage.
+          dlss_tools=()
+          bridge=_linux-patches/.github/linux-patches/dlss-bridge
+          if [ -f src/video_core/vulkan_common/streamline_linux.cpp ] && [ -f "$bridge/fritchii_dlss_bridge.cpp" ]; then
+            vk=$(find build .cache "$HOME/.cache" -path '*/include/vulkan/vulkan_core.h' -print -quit 2>/dev/null || true)
+            vkinc=${vk:+$(dirname "$(dirname "$vk")")}
+            [ -n "$vkinc" ] || { echo "::error::no Vulkan headers for the DLSS bridge"; exit 1; }
+            share=AppDir/usr/share/fritchii-dlss; mkdir -p "$share" AppDir/usr/share/doc/mold
+            flags="-O2 -fPIC -fvisibility=hidden -fno-stack-protector -U_FORTIFY_SOURCE"
+            g++ -std=c++20 $flags -Wall -I"$vkinc" -c "$bridge/fritchii_dlss_bridge.cpp" -o "$RUNNER_TEMP/fdb.o"
+            gcc $flags -Wall -c "$bridge/fritchii_dlss_dso.c" -o "$RUNNER_TEMP/fdb_dso.o"
+            ld -r "$RUNNER_TEMP/fdb.o" "$RUNNER_TEMP/fdb_dso.o" -o "$share/fritchii_dlss_bridge.o"
+            cp "$bridge/LICENSE" "$share/LICENSE"; cp "$bridge/README.md" "$share/README.md"
+            mold_tgz="$tools/mold.tar.gz"
+            curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o "$mold_tgz" \
+              https://github.com/rui314/mold/releases/download/v2.40.4/mold-2.40.4-x86_64-linux.tar.gz
+            echo "4c999e19ffa31afa5aa429c679b665d5e2ca5a6b6832ad4b79668e8dcf3d8ec1  $mold_tgz" | sha256sum -c -
+            tar -xzf "$mold_tgz" -C "$tools"
+            cp "$tools/mold-2.40.4-x86_64-linux/share/doc/mold/LICENSE" AppDir/usr/share/doc/mold/LICENSE
+            dlss_tools=(--executable "$tools/mold-2.40.4-x86_64-linux/bin/mold")
+            echo "DLSS bridge object and mold linker added"
+          fi
+          # The shader preparation recipes ("Preparing shaders": OoT's ~120k pipelines) ship only in
+          # Fritchii's Windows release; the program reads them from recipes/ next to itself. They
+          # must come from the same version (a recipe names the pipeline cache version it is for).
+          winzip="$tools/windows-${TAG}.zip"
+          if curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o "$winzip" \
+               "https://github.com/$UPSTREAM/releases/download/$TAG/Fritchii-${TAG#$TAG_PREFIX}-Windows-x64.zip" &&
+             unzip -l "$winzip" | grep -q '/recipes/.*\.nx2recipe'; then
+            mkdir -p AppDir/usr/bin/recipes
+            unzip -j -o "$winzip" '*/recipes/*' -d AppDir/usr/bin/recipes
+            ls -la AppDir/usr/bin/recipes
+            echo "SHADER_RECIPES=1" >> "$GITHUB_ENV"
+          else
+            echo "::warning::no shader recipes in Fritchii's Windows release of $TAG; Preparing shaders will be skipped"
+          fi
+          # The host's GPU driver loads into this process and can need a newer C++ runtime than
+          # Ubuntu 24.04's, and the Vulkan loader must match the host's driver: those come from the
+          # system (any system new enough for this glibc has them). A few libraries minimal desktop
+          # installs can lack are bundled instead.
+          extra_libs=()
+          for lib in libusb-1.0.so.0 libOpenGL.so.0 libfribidi.so.0 libcom_err.so.2 libgpg-error.so.0; do
+            [ -e "/usr/lib/x86_64-linux-gnu/$lib" ] && extra_libs+=(--library "/usr/lib/x86_64-linux-gnu/$lib")
+          done
+          "$tools/linuxdeploy-x86_64.AppImage" --appdir AppDir \
+            --executable build/release/bin/lichii \
+            --executable build/release/bin/eden-cli \
+            "${dlss_tools[@]}" \
+            --desktop-file dist/io.github.zortos293.lichii.desktop \
+            --icon-file "$icon" \
+            --exclude-library 'libstdc++.so*' \
+            --exclude-library 'libgcc_s.so*' \
+            --exclude-library 'libvulkan.so*' \
+            "${extra_libs[@]}" \
+            --plugin qt \
+            --output appimage
+          if [ -n "${LDAI_UPDATE_INFORMATION:-}" ] && [ ! -f "$LDAI_OUTPUT.zsync" ]; then
+            zsyncmake -u "$LDAI_OUTPUT" -o "$LDAI_OUTPUT.zsync" "$LDAI_OUTPUT"
+          fi
+          ls -la "$LDAI_OUTPUT"*
+          echo "APPIMAGE=$LDAI_OUTPUT" >> "$GITHUB_ENV"
+
+      # Test builds (any branch but nx2): an artifact on the run's page, never a release.
+      - name: Upload test build
+        if: github.ref_name != 'nx2'
+        run: |
+          sha256sum "$APPIMAGE" > "$APPIMAGE.sha256"
+          {
+            echo "TEST BUILD - not a release. Fritchii $TAG from branch $GITHUB_REF_NAME"
+            echo "(commit $GITHUB_SHA), run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Extra patches: ${EXTRA_PATCHES:-none}"
+            echo
+            echo "The zip drops the executable bit: chmod +x $APPIMAGE before running it."
+          } > TEST-BUILD.txt
+          echo "TEST_ARTIFACT=Tuxchii-${TAG#$TAG_PREFIX}-TEST-${GITHUB_REF_NAME//\//-}-run${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+
+      - name: Upload test build artifact
+        if: github.ref_name != 'nx2'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TEST_ARTIFACT }}
+          path: |
+            ${{ env.APPIMAGE }}
+            ${{ env.APPIMAGE }}.sha256
+            TEST-BUILD.txt
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish release
+        if: github.ref_name == 'nx2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rel="appimage-$TAG"
+          sha256sum "$APPIMAGE" > "$APPIMAGE.sha256"
+          export VER="${TAG#$TAG_PREFIX}" COMMIT="$(git rev-parse --short HEAD)"
+          export SHA256="$(cut -d' ' -f1 "$APPIMAGE.sha256")" CLASSIC="${CLASSIC_UI_DEFAULT:-0}"
+          # Frizti's own release notes for this version (the changelog), if the release has any.
+          gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq .body > "$RUNNER_TEMP/upstream.md" 2>/dev/null ||
+            : > "$RUNNER_TEMP/upstream.md"
+          # Release notes: the same layout for every version. {{...}} are filled in below.
+          cat > "$RUNNER_TEMP/notes.md" <<'EOF'
+          ## Linux changes in this build
+          Fritchii is only tested on Windows, so these changes are made for Linux before compiling (all visible in the public build log and in [linux-patches]({{PATCHES}})):
+          {{LINUX_BULLETS}}- **Compile fixes** for Windows-only code paths (X11 `Status` macro clash, Linux `GetExeDirectory()`, a Windows-only log variable), applied only where needed
+
+          Linux x86_64 AppImage of [Fritchii {{VER}}](https://github.com/{{UPSTREAM}}/releases/tag/{{TAG}}), built automatically on GitHub from upstream commit `{{COMMIT}}`.
+
+          > ⚠️ Unofficial build. Fritchii only publishes Windows builds. Report Linux-specific problems here, not upstream.
+          {{CLASSIC_SECTION}}
+          ## Download
+          **`{{APPIMAGE}}`**
+
+          SHA-256: `{{SHA256}}`
+
+          Already have Tuxchii? It updates itself: **Help → Check for Updates** (it also checks when it starts). Gear Lever, AppImageUpdate and AppImageLauncher can update it too.
+          <!-- tuxchii-build: {{BUILD}} -->
+
+          ## Run it
+          ```bash
+          chmod +x {{APPIMAGE}}
+          ./{{APPIMAGE}}
+          ```
+          If it complains about FUSE, run it with `--appimage-extract-and-run`.
+
+          ## Requirements
+          - x86_64 Linux with **glibc 2.39+** (Ubuntu 24.04, Fedora 40, current Arch/SteamOS or newer)
+          - A GPU with a working **Vulkan** driver
+
+          **NVIDIA tip:** the driver trims its shader cache at about 1 GB by default, which can bring back stutter. Add these two lines to `/etc/environment` and reboot:
+          ```
+          __GL_SHADER_DISK_CACHE_SIZE=10737418240
+          __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1
+          ```
+
+          {{CHANGELOG}}
+          ## Notes
+          - Games, keys and firmware are **not** included. Only use files you've legally dumped yourself.
+          - Thanks to Frizti, zortos293 and the Lichii/Eden/yuzu contributors.
+          EOF
+          cat > "$RUNNER_TEMP/classic.md" <<'EOF'
+
+          ## Classic interface by default
+
+          **This build opens in the classic interface**, mainly so it works well with SteamOS / Steam Big Picture mode. It also follows your desktop theme, font size and scaling like any other Qt app, which Fritchii's own dark interface (Graphite theme, Inter font, home screen) doesn't.
+
+          To use Fritchii's interface instead:
+          - **Settings → UI → General → "Use the Fritchii interface (restart required)"**, then restart Fritchii. Untick it the same way to go back.
+          - Or for a single launch, set `FRITCHII_CLASSIC_UI=0` (forces Fritchii's interface) or `FRITCHII_CLASSIC_UI=1` (forces the classic one).
+
+          Emulation, performance and shader features are identical in both; only the interface changes.
+          EOF
+          python3 - "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP/classic.md" "$GITHUB_REPOSITORY" <<'PY'
+          import os, sys
+          notes, classic, repo = open(sys.argv[1]).read(), open(sys.argv[2]).read(), sys.argv[3]
+          on = os.environ["CLASSIC"] == "1"
+          patches = f"https://github.com/{repo}/tree/{os.environ.get('GITHUB_REF_NAME', 'nx2')}/.github/linux-patches"
+          link = lambda name: f"https://github.com/{repo}/blob/{os.environ.get('GITHUB_REF_NAME', 'nx2')}/.github/linux-patches/{name}"
+          applied = os.environ.get("EXTRA_PATCHES", "").split(", ")
+          # One line per Linux patch this build applied, newest features first.
+          bullets = ""
+          if "zz-nvidia-dlss-linux.patch" in applied:
+              bullets += (f"- **NVIDIA DLSS on Linux** (RTX cards): **Settings → Graphics → Install DLSS...** downloads NVIDIA's DLSS files (about 60 MB) "
+                          f"from NVIDIA onto your PC, then the DLSS option and DLSS quality modes work as on Windows. NVIDIA's license doesn't allow "
+                          f"shipping those files here, so they are never part of the AppImage ([patch]({link('zz-nvidia-dlss-linux.patch')}), "
+                          f"[bridge]({link('dlss-bridge/README.md')}))\n")
+          if "shader-setup-prompt.patch" in applied:
+              bullets += (f"- **Shader setup on a game's first launch:** Fritchii offers to pre-build all of the game's shaders before you play (much smoother, "
+                          f"about 20 minutes or more). The game starts paused while they build and tells you when it's ready "
+                          f"([patch]({link('shader-setup-prompt.patch')}))\n")
+          if "shader-cache-import.patch" in applied:
+              bullets += (f"- **Your shader cache comes along:** v5.8 moved Fritchii's folders from `eden` to `fritchii` and copies settings, saves and keys, "
+                          f"but not caches. This build also copies each game's shader cache from `~/.cache/eden` (or Lichii's) to `~/.cache/fritchii` once, "
+                          f"so games don't start stuttering again ([patch]({link('shader-cache-import.patch')}))\n")
+          if os.environ.get("SHADER_RECIPES") == "1":
+              bullets += ("- **Full shader preparation:** Fritchii's shader recipes (from its Windows release of the same version) are included, "
+                          "so the \"Preparing shaders\" screen builds all of a game's shaders (about 120,000 for Ocarina of Time) like on Windows\n")
+          if os.environ.get("PGO_BUILD") == "1":
+              bullets += ("- **Built like Fritchii's own Linux build:** Clang with Fritchii's PGO profile (`eglantine.profdata`), for faster emulation; "
+                          "the C++ runtime and Vulkan loader come from your system, so new GPU drivers load cleanly\n")
+          if "tuxchii-updater.patch" in applied:
+              bullets += (f"- **Updates from this repo:** Help → Check for Updates (and a check at startup) downloads the newest Tuxchii AppImage, "
+                          f"checks its SHA-256, replaces this one and restarts; the old version is kept for Roll Back. Fritchii's own updater "
+                          f"only installs its Windows build ([patch]({link('tuxchii-updater.patch')}))\n")
+          if os.environ.get("TUXCHII_BRANDING") == "1":
+              bullets += (f"- **Tuxchii name** in every window and dialog. Data folders, settings and saves are unchanged, "
+                          f"so nothing moves ([script]({link('tuxchii-branding.py')}))\n")
+          if "steam-deck-test.patch" in applied:
+              bullets += (f"- **Prepare Shaders on AMD and Intel (Steam Deck too):** upstream only prepares shaders on NVIDIA; Mesa drivers (RADV, ANV, NVK) "
+                          f"now get them as well, the classic interface shows the \"Preparing shaders\" screen, and a Steam Deck switches to handheld mode once "
+                          f"(docked 1080p is too heavy for it) ([patch]({link('steam-deck-test.patch')}))\n")
+          # Frizti's changelog: everything after the first "---" line (above it are the Windows
+          # download instructions, which don't apply to the AppImage).
+          upstream = open(os.path.join(os.environ["RUNNER_TEMP"], "upstream.md")).read().replace("\r\n", "\n")
+          parts = upstream.split("\n---\n", 1)
+          changelog = (parts[1] if len(parts) == 2 else upstream).strip()
+          # Keep only this version's own changes: Frizti repeats earlier versions under headings
+          # like "### In v5.2" or "### Everything new in v5"; cut at the first heading naming another.
+          import re
+          for m in re.finditer(r"^#{1,6} .*?\bv(\d+(?:\.\d+)*)\b", changelog, re.M):
+              if m.group(1) != os.environ["VER"].lstrip("v"):
+                  changelog = changelog[:m.start()].rstrip()
+                  break
+          if changelog:
+              changelog = (f"## What's new in Fritchii {os.environ['VER']}\n"
+                           f"*From Frizti's [release notes](https://github.com/{os.environ['UPSTREAM']}/releases/tag/"
+                           f"{os.environ['TAG']}) (Windows download instructions left out).*\n\n{changelog}\n\n")
+          values = {
+              "CHANGELOG": changelog,
+              "VER": os.environ["VER"], "TAG": os.environ["TAG"], "UPSTREAM": os.environ["UPSTREAM"],
+              "COMMIT": os.environ["COMMIT"], "SHA256": os.environ["SHA256"], "APPIMAGE": os.environ["APPIMAGE"],
+              "CLASSIC_SECTION": classic if on else "",
+              "PATCHES": patches,
+              "BUILD": os.environ.get("TUXCHII_BUILD_NUMBER", "0"),
+              "LINUX_BULLETS": bullets + (f"- **Classic interface by default**, with a settings checkbox to switch (see below) ([patch]({link('classic-ui-setting.patch')}))\n" if on else ""),
+          }
+          for k, v in values.items():
+              notes = notes.replace("{{" + k + "}}", v)
+          open(sys.argv[1], "w").write(notes)
+          PY
+          files=("$APPIMAGE" "$APPIMAGE.sha256")
+          [ -f "$APPIMAGE.zsync" ] && files+=("$APPIMAGE.zsync")
+          if gh release view "$rel" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # A rebuild under a new file name: remove the old files, so only this build is offered.
+            gh release view "$rel" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
+              while read -r asset; do
+                case " ${files[*]##*/} " in *" $asset "*) ;; *)
+                  gh release delete-asset "$rel" "$asset" --yes --repo "$GITHUB_REPOSITORY" ;;
+                esac
+              done
+            gh release upload "$rel" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$rel" --notes-file "$RUNNER_TEMP/notes.md" --repo "$GITHUB_REPOSITORY"
+            if [ "$LATEST" = "true" ]; then gh release edit "$rel" --latest --repo "$GITHUB_REPOSITORY"; fi
+          else
+            gh release create "$rel" "${files[@]}" --repo "$GITHUB_REPOSITORY" \
+              --title "Fritchii ${TAG#$TAG_PREFIX} (Linux AppImage)" --notes-file "$RUNNER_TEMP/notes.md" \
+              --latest="${LATEST:-false}"
+          fi
+# Auto-builds a Linux x86_64 AppImage for every new Fritchii release and publishes it as a
+# release in this repository.
+#
+# Put this file at .github/workflows/appimage-auto-release.yml on your fork's default branch.
+# - Every 2 hours it checks Frizti/Fritchii's newest "fritchii-*" releases (BACKFILL of them);
+#   x.y.z patch releases are skipped unless their tag is entered by hand.
+# - Each one this repo has no "appimage-<tag>" release for yet is built and published.
+# - Run it by hand from the Actions tab to build now, or to rebuild a specific tag.
+# - TEST BUILDS: run it from any other branch (Run workflow > "Use workflow from: testing").
+#   That builds the given tag (blank = newest) with that branch's patches and uploads the
+#   AppImage as a workflow artifact on the run's page. It never touches Releases.
+
+name: appimage-auto-release
+
+on:
+  schedule:
+    - cron: "17 */2 * * *" # every 2 hours, at :17
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream tag to build (blank = every missing recent fritchii-* release)
+        required: false
+        default: ""
+      force:
+        description: Rebuild even if this repo already has a release for it
+        type: boolean
+        default: false
+
+env:
+  UPSTREAM: Frizti/Fritchii
+  TAG_PREFIX: fritchii-
+  BACKFILL: 3 # how many of the newest upstream releases to check for missing builds
+  # Clang for the PGO build, the same major as Fritchii's own Linux PGO job (release-binaries.yml):
+  # the repo's eglantine.profdata needs a current LLVM.
+  PGO_LLVM_VERSION: "23"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check for new releases
+    runs-on: ubuntu-24.04
+    outputs:
+      tags: ${{ steps.find.outputs.tags }}
+      newest: ${{ steps.find.outputs.newest }}
       build: ${{ steps.find.outputs.build }}
     steps:
       - id: find
