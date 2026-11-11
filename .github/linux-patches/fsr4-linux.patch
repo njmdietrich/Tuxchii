@@ -1,0 +1,178 @@
+diff --git a/src/qt_common/util/vk.cpp b/src/qt_common/util/vk.cpp
+index 11a355ae66..dcc9286b17 100644
+--- a/src/qt_common/util/vk.cpp
++++ b/src/qt_common/util/vk.cpp
+@@ -68,7 +68,13 @@ void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
+             Vulkan::Device::CheckBrokenCompute(driverID, properties.properties.driverVersion)};
+ 
+         const bool fsr4_capable = VideoCommon::IsFsr4CapableGpu(
+-            properties.properties.vendorID, driverID == VK_DRIVER_ID_AMD_PROPRIETARY, name);
++            properties.properties.vendorID,
++            driverID == VK_DRIVER_ID_AMD_PROPRIETARY
++#if defined(__linux__) && !defined(__ANDROID__)
++                || driverID == VK_DRIVER_ID_MESA_RADV // Linux build patch: fsr4-vk
++#endif
++            ,
++            name);
+ 
+         std::string driver_string = Vulkan::vk::GetDriverName(driver_properties);
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_fsr4_upscaler.cpp b/src/video_core/renderer_vulkan/vk_fsr4_upscaler.cpp
+index 78c4f00671..8b458bde2b 100644
+--- a/src/video_core/renderer_vulkan/vk_fsr4_upscaler.cpp
++++ b/src/video_core/renderer_vulkan/vk_fsr4_upscaler.cpp
+@@ -149,7 +149,12 @@ std::optional<Provider> FindFsr4(const FfxRuntime::Api& api, const Device& devic
+ 
+ bool Fsr4Upscaler::IsWanted(const Device& device) {
+     return Settings::values.oot_anti_aliasing.GetValue() == Settings::OotAntiAliasing::Fsr4 &&
+-           device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY;
++           (device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY
++#if defined(__linux__) && !defined(__ANDROID__)
++            // Linux build patch: fsr4-vk on RADV.
++            || device.GetDriverID() == VK_DRIVER_ID_MESA_RADV
++#endif
++           );
+ }
+ 
+ Fsr4Upscaler::Fsr4Upscaler(const Device& device_, Scheduler& scheduler_,
+diff --git a/src/video_core/vulkan_common/ffx_runtime.cpp b/src/video_core/vulkan_common/ffx_runtime.cpp
+index c9432c9a5d..bf53dc215a 100644
+--- a/src/video_core/vulkan_common/ffx_runtime.cpp
++++ b/src/video_core/vulkan_common/ffx_runtime.cpp
+@@ -21,6 +21,9 @@
+ #include <softpub.h>
+ #include <wincrypt.h>
+ #include <wintrust.h>
++#elif defined(__linux__) && !defined(__ANDROID__)
++#include <cstdlib>
++#include <dlfcn.h>
+ #endif
+ 
+ namespace Vulkan::FfxRuntime {
+@@ -207,6 +210,84 @@ std::shared_ptr<const Api> Acquire() {
+     return shared;
+ }
+ 
++#elif defined(__linux__) && !defined(__ANDROID__)
++
++bool IsSignedByAmd(const std::filesystem::path&) {
++    return false;
++}
++
++bool HasSha256(const std::filesystem::path&, std::string_view) {
++    return false;
++}
++
++// Linux build patch (Tuxchii): AMD ships FSR 4 for Windows only. The AppImage carries fsr4-vk
++// (github.com/Astyyyyy/fsr4-vk, GPL-3.0), an open Vulkan implementation of FSR 4.1.1 built from
++// AMD's MIT-licensed FidelityFX SDK 2.3.0 files when Tuxchii is built. It exports the same FFX API
++// as AMD's upscaler, so it is called the same way. TUXCHII_FSR4_LIBRARY names another copy.
++namespace {
++std::mutex mutex;
++std::weak_ptr<const Api> current;
++
++struct Loaded : Api {
++    void* handle{};
++};
++
++std::filesystem::path LibraryPath() {
++    if (const char* path = std::getenv("TUXCHII_FSR4_LIBRARY"); path != nullptr && path[0]) {
++        return path;
++    }
++    std::error_code ec;
++    const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
++    if (ec) {
++        return {};
++    }
++    // AppDir/usr/bin/<app> -> AppDir/usr/lib/fsr4/
++    return exe.parent_path().parent_path() / "lib" / "fsr4" / "amd_fidelityfx_upscaler_vk.so";
++}
++} // Anonymous namespace
++
++std::shared_ptr<const Api> Acquire() {
++    std::scoped_lock lock{mutex};
++    if (auto existing = current.lock()) {
++        return existing;
++    }
++    const std::filesystem::path path = LibraryPath();
++    std::error_code ec;
++    if (path.empty() || !std::filesystem::is_regular_file(path, ec)) {
++        LOG_INFO(Render_Vulkan, "AMD FSR 4: {} is missing; using FSR 3.1",
++                 Common::FS::PathToUTF8String(path));
++        return nullptr;
++    }
++    void* const handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
++    if (handle == nullptr) {
++        const char* error = dlerror();
++        LOG_WARNING(Render_Vulkan, "AMD FSR 4: fsr4-vk doesn't load ({})",
++                    error ? error : "unknown error");
++        return nullptr;
++    }
++    auto loaded = std::make_unique<Loaded>();
++    loaded->handle = handle;
++    loaded->create_context = reinterpret_cast<PfnFfxCreateContext>(dlsym(handle, "ffxCreateContext"));
++    loaded->destroy_context =
++        reinterpret_cast<PfnFfxDestroyContext>(dlsym(handle, "ffxDestroyContext"));
++    loaded->query = reinterpret_cast<PfnFfxQuery>(dlsym(handle, "ffxQuery"));
++    loaded->dispatch = reinterpret_cast<PfnFfxDispatch>(dlsym(handle, "ffxDispatch"));
++    if (!loaded->create_context || !loaded->destroy_context || !loaded->query ||
++        !loaded->dispatch) {
++        LOG_WARNING(Render_Vulkan, "AMD FSR 4: fsr4-vk lacks the FFX API exports");
++        dlclose(handle);
++        return nullptr;
++    }
++    LOG_INFO(Render_Vulkan, "AMD FSR 4: fsr4-vk loaded from {}",
++             Common::FS::PathToUTF8String(path));
++    std::shared_ptr<const Loaded> shared{loaded.release(), [](const Loaded* l) {
++                                             dlclose(l->handle);
++                                             delete l;
++                                         }};
++    current = shared;
++    return shared;
++}
++
+ #else
+ 
+ bool IsSignedByAmd(const std::filesystem::path&) {
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index b7289d95ad..f947908324 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -504,6 +504,11 @@ bool WantsAmdFsr4(VkDriverId driver_id) {
+ #ifdef _WIN32
+     return driver_id == VK_DRIVER_ID_AMD_PROPRIETARY &&
+            Settings::values.oot_anti_aliasing.GetValue() == Settings::OotAntiAliasing::Fsr4;
++#elif defined(__linux__) && !defined(__ANDROID__)
++    // Linux build patch: FSR 4 (fsr4-vk) on RADV, Mesa's AMD driver. Only while FSR 4 is picked,
++    // so nothing changes on other GPUs or settings.
++    return driver_id == VK_DRIVER_ID_MESA_RADV &&
++           Settings::values.oot_anti_aliasing.GetValue() == Settings::OotAntiAliasing::Fsr4;
+ #else
+     return false;
+ #endif
+diff --git a/src/yuzu/configuration/configure_graphics.cpp b/src/yuzu/configuration/configure_graphics.cpp
+index e9e7405342..77bfde9234 100644
+--- a/src/yuzu/configuration/configure_graphics.cpp
++++ b/src/yuzu/configuration/configure_graphics.cpp
+@@ -572,7 +572,7 @@ void ConfigureGraphics::UpdateAmdFsr4Visibility() {
+         return;
+     }
+     // AMD's FSR 4 runtime is Windows-only and runs on the GPUs IsFsr4CapableGpu names.
+-#ifdef _WIN32
++#if defined(_WIN32) || defined(__linux__)
+     const int device = vulkan_device_combobox ? vulkan_device_combobox->currentIndex() : -1;
+     const bool capable = GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan &&
+                          device >= 0 && static_cast<size_t>(device) < records.size() &&
+@@ -588,7 +588,12 @@ void ConfigureGraphics::UpdateAmdFsr4Visibility() {
+     if (auto* view = qobject_cast<QListView*>(oot_aa_combobox->view()); view && fsr4_row >= 0) {
+         view->setRowHidden(fsr4_row, !capable && !fsr4_picked);
+     }
++#ifdef _WIN32
+     amd_fsr4_panel->setVisible(capable && fsr4_picked);
++#else
++    // Linux build patch: FSR 4 (fsr4-vk) ships in the AppImage; there is nothing to download.
++    amd_fsr4_panel->setVisible(false);
++#endif
+ }
+ 
+ void ConfigureGraphics::RetrieveVulkanDevices() {
