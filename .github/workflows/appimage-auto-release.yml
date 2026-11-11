@@ -423,7 +423,7 @@ jobs:
           Fritchii is only tested on Windows, so these changes are made for Linux before compiling (all visible in the public build log and in [linux-patches]({{PATCHES}})):
           {{LINUX_BULLETS}}- **Compile fixes** for Windows-only code paths (X11 `Status` macro clash, Linux `GetExeDirectory()`, a Windows-only log variable), applied only where needed
 
-          Linux x86_64 AppImage of [Fritchii {{VER}}](https://github.com/{{UPSTREAM}}/releases/tag/{{TAG}}), built automatically on GitHub from upstream commit `{{COMMIT}}`.
+          Tuxchii {{VER}}: a Linux x86_64 AppImage of [Fritchii {{VER}}](https://github.com/{{UPSTREAM}}/releases/tag/{{TAG}}), built automatically on GitHub from upstream commit `{{COMMIT}}`.
 
           > ⚠️ Unofficial build. Fritchii only publishes Windows builds. Report Linux-specific problems here, not upstream.
           {{CLASSIC_SECTION}}
@@ -463,9 +463,9 @@ jobs:
 
           **This build opens in the classic interface**, mainly so it works well with SteamOS / Steam Big Picture mode. It also follows your desktop theme, font size and scaling like any other Qt app, which Fritchii's own dark interface (Graphite theme, Inter font, home screen) doesn't.
 
-          To use Fritchii's interface instead:
-          - **Settings → UI → General → "Use the Fritchii interface (restart required)"**, then restart Fritchii. Untick it the same way to go back.
-          - Or for a single launch, set `FRITCHII_CLASSIC_UI=0` (forces Fritchii's interface) or `FRITCHII_CLASSIC_UI=1` (forces the classic one).
+          To use Fritchii's dark interface instead:
+          - **Settings → UI → General → "Use the Tuxchii interface (restart required)"**, then restart Tuxchii. Untick it the same way to go back.
+          - Or for a single launch, set `FRITCHII_CLASSIC_UI=0` (forces the dark interface) or `FRITCHII_CLASSIC_UI=1` (forces the classic one).
 
           Emulation, performance and shader features are identical in both; only the interface changes.
           EOF
@@ -484,7 +484,7 @@ jobs:
                           f"shipping those files here, so they are never part of the AppImage ([patch]({link('zz-nvidia-dlss-linux.patch')}), "
                           f"[bridge]({link('dlss-bridge/README.md')}))\n")
           if "shader-setup-prompt.patch" in applied:
-              bullets += (f"- **Shader setup on a game's first launch:** Fritchii offers to pre-build all of the game's shaders before you play (much smoother, "
+              bullets += (f"- **Shader setup on a game's first launch:** Tuxchii offers to pre-build all of the game's shaders before you play (much smoother, "
                           f"about 20 minutes or more). The game starts paused while they build and tells you when it's ready "
                           f"([patch]({link('shader-setup-prompt.patch')}))\n")
           if "shader-cache-import.patch" in applied:
@@ -537,6 +537,7 @@ jobs:
               notes = notes.replace("{{" + k + "}}", v)
           open(sys.argv[1], "w").write(notes)
           PY
+          title="Tuxchii ${TAG#$TAG_PREFIX} (Linux AppImage)"
           files=("$APPIMAGE" "$APPIMAGE.sha256")
           [ -f "$APPIMAGE.zsync" ] && files+=("$APPIMAGE.zsync")
           if gh release view "$rel" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -548,10 +549,10 @@ jobs:
                 esac
               done
             gh release upload "$rel" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
-            gh release edit "$rel" --notes-file "$RUNNER_TEMP/notes.md" --repo "$GITHUB_REPOSITORY"
+            gh release edit "$rel" --title "$title" --notes-file "$RUNNER_TEMP/notes.md" --repo "$GITHUB_REPOSITORY"
             if [ "$LATEST" = "true" ]; then gh release edit "$rel" --latest --repo "$GITHUB_REPOSITORY"; fi
           else
             gh release create "$rel" "${files[@]}" --repo "$GITHUB_REPOSITORY" \
-              --title "Fritchii ${TAG#$TAG_PREFIX} (Linux AppImage)" --notes-file "$RUNNER_TEMP/notes.md" \
+              --title "$title" --notes-file "$RUNNER_TEMP/notes.md" \
               --latest="${LATEST:-false}"
           fi
