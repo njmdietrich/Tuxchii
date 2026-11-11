@@ -131,7 +131,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential make perl libssl-dev autoconf g++ gcc git glslang-tools libglu1-mesa-dev \
+            build-essential make perl libssl-dev autoconf g++ gcc git glslang-tools libglu1-mesa-dev zsync \
             libpulse-dev libtool libudev-dev libxkbcommon-x11-0 \
             mesa-common-dev nasm ninja-build qt6-base-private-dev \
             qt6-charts-dev qt6-tools-dev libavfilter-dev libavcodec-dev \
@@ -216,6 +216,12 @@ jobs:
           echo "EXTRA_PATCHES=$extra" >> "$GITHUB_ENV"
           # 7. Tuxchii branding: the app's name in every window and dialog. Internal names (data
           #    folders, settings keys, environment variables) are unchanged, so existing data works.
+          # 8. What the Tuxchii updater (tuxchii-updater.patch) compares with GitHub: release builds carry
+          #    their workflow run number; test builds 0, so any release of the same version is newer.
+          build_number=0; [ "$GITHUB_REF_NAME" = nx2 ] && build_number="$GITHUB_RUN_NUMBER"
+          printf '#pragma once\n#define TUXCHII_REPO "%s"\n#define TUXCHII_BUILD_NUMBER %s\n' \
+            "$GITHUB_REPOSITORY" "$build_number" > src/yuzu/tuxchii_build.h
+          echo "TUXCHII_BUILD_NUMBER=$build_number" >> "$GITHUB_ENV"
           b=_linux-patches/.github/linux-patches/tuxchii-branding.py
           if [ -f "$b" ]; then
             python3 "$b" . | tail -n 60
@@ -268,8 +274,14 @@ jobs:
           export EXTRA_QT_MODULES=waylandcompositor
           export EXTRA_PLATFORM_PLUGINS='libqwayland-egl.so;libqwayland-generic.so'
           export LINUXDEPLOY_OUTPUT_VERSION="$TAG"
-          export LDAI_OUTPUT="Fritchii-${TAG#$TAG_PREFIX}-x86_64.AppImage"
+          export LDAI_OUTPUT="Tuxchii-${TAG#$TAG_PREFIX}-x86_64.AppImage"
           export OUTPUT="$LDAI_OUTPUT" ARCH=x86_64
+          # Releases: AppImage update information, so AppImageUpdate, Gear Lever and AppImageLauncher
+          # can update it from this repo's latest release (with the .zsync file published beside it).
+          if [ "$GITHUB_REF_NAME" = nx2 ]; then
+            export LDAI_UPDATE_INFORMATION="gh-releases-zsync|${GITHUB_REPOSITORY%%/*}|${GITHUB_REPOSITORY#*/}|latest|Tuxchii-*x86_64.AppImage.zsync"
+            export UPDATE_INFORMATION="$LDAI_UPDATE_INFORMATION"
+          fi
           # NVIDIA DLSS (when the DLSS patch is applied): the MIT-licensed Fritchii DLSS bridge as an
           # object file and the mold linker (MIT), so Settings > Graphics > Install DLSS can link the
           # bridge with NVIDIA's SDK files on the user's PC. Nothing of NVIDIA's is in the AppImage.
@@ -302,7 +314,10 @@ jobs:
             --icon-file "$icon" \
             --plugin qt \
             --output appimage
-          ls -la "$LDAI_OUTPUT"
+          if [ -n "${LDAI_UPDATE_INFORMATION:-}" ] && [ ! -f "$LDAI_OUTPUT.zsync" ]; then
+            zsyncmake -u "$LDAI_OUTPUT" -o "$LDAI_OUTPUT.zsync" "$LDAI_OUTPUT"
+          fi
+          ls -la "$LDAI_OUTPUT"*
           echo "APPIMAGE=$LDAI_OUTPUT" >> "$GITHUB_ENV"
 
       # Test builds (any branch but nx2): an artifact on the run's page, never a release.
@@ -317,7 +332,7 @@ jobs:
             echo
             echo "The zip drops the executable bit: chmod +x $APPIMAGE before running it."
           } > TEST-BUILD.txt
-          echo "TEST_ARTIFACT=Fritchii-${TAG#$TAG_PREFIX}-TEST-${GITHUB_REF_NAME//\//-}-run${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+          echo "TEST_ARTIFACT=Tuxchii-${TAG#$TAG_PREFIX}-TEST-${GITHUB_REF_NAME//\//-}-run${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
 
       - name: Upload test build artifact
         if: github.ref_name != 'nx2'
@@ -358,6 +373,9 @@ jobs:
           **`{{APPIMAGE}}`**
 
           SHA-256: `{{SHA256}}`
+
+          Already have Tuxchii? It updates itself: **Help → Check for Updates** (it also checks when it starts). Gear Lever, AppImageUpdate and AppImageLauncher can update it too.
+          <!-- tuxchii-build: {{BUILD}} -->
 
           ## Run it
           ```bash
@@ -415,6 +433,10 @@ jobs:
               bullets += (f"- **Your shader cache comes along:** v5.8 moved Fritchii's folders from `eden` to `fritchii` and copies settings, saves and keys, "
                           f"but not caches. This build also copies each game's shader cache from `~/.cache/eden` (or Lichii's) to `~/.cache/fritchii` once, "
                           f"so games don't start stuttering again ([patch]({link('shader-cache-import.patch')}))\n")
+          if "tuxchii-updater.patch" in applied:
+              bullets += (f"- **Updates from this repo:** Help → Check for Updates (and a check at startup) downloads the newest Tuxchii AppImage, "
+                          f"checks its SHA-256, replaces this one and restarts; the old version is kept for Roll Back. Fritchii's own updater "
+                          f"only installs its Windows build ([patch]({link('tuxchii-updater.patch')}))\n")
           if os.environ.get("TUXCHII_BRANDING") == "1":
               bullets += (f"- **Tuxchii name** in every window and dialog. Data folders, settings and saves are unchanged, "
                           f"so nothing moves ([script]({link('tuxchii-branding.py')}))\n")
@@ -444,18 +466,28 @@ jobs:
               "COMMIT": os.environ["COMMIT"], "SHA256": os.environ["SHA256"], "APPIMAGE": os.environ["APPIMAGE"],
               "CLASSIC_SECTION": classic if on else "",
               "PATCHES": patches,
+              "BUILD": os.environ.get("TUXCHII_BUILD_NUMBER", "0"),
               "LINUX_BULLETS": bullets + (f"- **Classic interface by default**, with a settings checkbox to switch (see below) ([patch]({link('classic-ui-setting.patch')}))\n" if on else ""),
           }
           for k, v in values.items():
               notes = notes.replace("{{" + k + "}}", v)
           open(sys.argv[1], "w").write(notes)
           PY
+          files=("$APPIMAGE" "$APPIMAGE.sha256")
+          [ -f "$APPIMAGE.zsync" ] && files+=("$APPIMAGE.zsync")
           if gh release view "$rel" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$rel" "$APPIMAGE" "$APPIMAGE.sha256" --clobber --repo "$GITHUB_REPOSITORY"
+            # A rebuild under a new file name: remove the old files, so only this build is offered.
+            gh release view "$rel" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
+              while read -r asset; do
+                case " ${files[*]##*/} " in *" $asset "*) ;; *)
+                  gh release delete-asset "$rel" "$asset" --yes --repo "$GITHUB_REPOSITORY" ;;
+                esac
+              done
+            gh release upload "$rel" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
             gh release edit "$rel" --notes-file "$RUNNER_TEMP/notes.md" --repo "$GITHUB_REPOSITORY"
             if [ "$LATEST" = "true" ]; then gh release edit "$rel" --latest --repo "$GITHUB_REPOSITORY"; fi
           else
-            gh release create "$rel" "$APPIMAGE" "$APPIMAGE.sha256" --repo "$GITHUB_REPOSITORY" \
+            gh release create "$rel" "${files[@]}" --repo "$GITHUB_REPOSITORY" \
               --title "Fritchii ${TAG#$TAG_PREFIX} (Linux AppImage)" --notes-file "$RUNNER_TEMP/notes.md" \
               --latest="${LATEST:-false}"
           fi
