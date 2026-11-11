@@ -1,0 +1,107 @@
+diff --git a/src/yuzu/main_window.cpp b/src/yuzu/main_window.cpp
+index 951725d..c429b47 100644
+--- a/src/yuzu/main_window.cpp
++++ b/src/yuzu/main_window.cpp
+@@ -383,6 +383,92 @@ inline static bool isDarkMode() {
+ }
+ #endif // _WIN32
+ 
++#ifdef __linux__
++#include <filesystem>
++#include <fstream>
++#include <map>
++#include "common/fs/fs_paths.h"
++#include "common/fs/profile_migration.h"
++#include "frontend_common/profile_import.h"
++
++namespace {
++
++// Linux build patch: Fritchii v5.8 moved to its own folders (~/.local/share/fritchii,
++// ~/.cache/fritchii) and its profile import leaves caches behind, so every game lost its shader
++// cache (the shaders it has used, rebuilt by "Loading Shaders" at boot) and its prepared shader
++// list. Once after an import, copy each game's shader folder from the old cache folder (eden or
++// lichii; the newer one when both have it) unless this profile already has a bigger one.
++void ImportLegacyShaderCaches() {
++    namespace fs = std::filesystem;
++    using namespace Common::FS;
++    const fs::path destination = GetEdenPath(EdenPath::ShaderDir);
++    const fs::path marker = destination / ".linux-shader-cache-imported";
++    std::error_code ec;
++    if (IsPortableMode() || fs::exists(marker, ec) ||
++        ProfileMigration::GetState(FrontendCommon::ProfileImportStateDirectory()) !=
++            ProfileMigration::State::Complete) {
++        return;
++    }
++    struct Source {
++        fs::path folder;
++        fs::file_time_type time;
++    };
++    std::map<fs::path, Source> games; // A game's folder name -> where to copy it from
++    for (const auto legacy : {EmuPath::LegacyEdenCacheDir, EmuPath::LichiiCacheDir}) {
++        const fs::path shaders = GetLegacyPath(legacy) / SHADER_DIR;
++        if (shaders == destination || !fs::is_directory(shaders, ec)) {
++            continue;
++        }
++        for (const auto& entry : fs::directory_iterator(shaders, ec)) {
++            if (!entry.is_directory(ec)) {
++                continue;
++            }
++            const auto time = fs::last_write_time(entry.path(), ec);
++            const auto [it, added] = games.try_emplace(entry.path().filename(),
++                                                       Source{entry.path(), time});
++            if (!added && time > it->second.time) {
++                it->second = Source{entry.path(), time};
++            }
++        }
++    }
++    const auto size = [&ec](const fs::path& folder) {
++        std::uintmax_t bytes = 0;
++        for (const auto& entry : fs::recursive_directory_iterator(folder, ec)) {
++            if (entry.is_regular_file(ec)) {
++                bytes += entry.file_size(ec);
++            }
++        }
++        return bytes;
++    };
++    int copied = 0;
++    for (const auto& [name, source] : games) {
++        const fs::path target = destination / name;
++        // A game played in this profile before the copy has a small new cache: the old one,
++        // bigger, replaces it (the few shaders it adds are recorded again while playing).
++        if (fs::exists(target, ec)) {
++            if (size(target) >= size(source.folder)) {
++                continue;
++            }
++            fs::remove_all(target, ec);
++        }
++        fs::create_directories(destination, ec);
++        fs::copy(source.folder, target, fs::copy_options::recursive, ec);
++        if (ec) {
++            LOG_WARNING(Frontend, "Could not copy the shader cache {}: {}",
++                        PathToUTF8String(source.folder), ec.message());
++            fs::remove_all(target, ec);
++            continue;
++        }
++        ++copied;
++    }
++    fs::create_directories(destination, ec);
++    std::ofstream{marker} << "Shader caches were copied from the old profile.\n";
++    LOG_INFO(Frontend, "Copied {} game shader cache(s) from the old profile", copied);
++}
++
++} // namespace
++#endif
++
+ MainWindow::MainWindow(bool has_broken_vulkan)
+     : ui{std::make_unique<Ui::MainWindow>()},
+       input_subsystem{std::make_shared<InputCommon::InputSubsystem>()}, user_data_migrator{this} {
+@@ -390,6 +476,9 @@ MainWindow::MainWindow(bool has_broken_vulkan)
+ 
+     Common::FS::CreateEdenPaths();
+     this->config = std::make_unique<QtConfig>();
++#ifdef __linux__
++    ImportLegacyShaderCaches();
++#endif
+     MigrateFriztiSettings();
+ 
+     Common::Log::Filter filter;

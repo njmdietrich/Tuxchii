@@ -1,0 +1,1410 @@
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index bf83c1b..bcc8a75 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -638,4 +638,23 @@ if (ENABLE_NVIDIA_DLSS)
+     message(STATUS "NVIDIA DLSS through Streamline: ${STREAMLINE_INCLUDE_DIR}")
+ endif()
+ 
++# Linux build patch: NVIDIA DLSS on Linux through the Fritchii DLSS bridge (NVIDIA NGX). Nothing of
++# NVIDIA's is compiled in or linked: the bridge is loaded at run time from the user folder, where
++# Settings > Graphics > Install DLSS links it from NVIDIA's SDK files on the user's own PC.
++option(ENABLE_NVIDIA_DLSS_LINUX "Enable NVIDIA DLSS on Linux through the Fritchii DLSS bridge" ON)
++if (ENABLE_NVIDIA_DLSS_LINUX AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ARCHITECTURE_x86_64
++    AND NOT ENABLE_NVIDIA_DLSS)
++    target_sources(video_core PRIVATE
++        renderer_vulkan/vk_streamline_dlss_linux.cpp
++        renderer_vulkan/vk_streamline_dlss.h
++        vulkan_common/fritchii_dlss_bridge.h
++        vulkan_common/streamline_linux.cpp
++        vulkan_common/streamline_linux.h
++        vulkan_common/streamline.h
++    )
++    target_link_libraries(video_core PRIVATE ${CMAKE_DL_LIBS})
++    target_compile_definitions(video_core PUBLIC EGLANTINE_STREAMLINE EGLANTINE_DLSS_BRIDGE)
++    message(STATUS "NVIDIA DLSS through the Fritchii DLSS bridge (Linux)")
++endif()
++
+ create_target_directory_groups(video_core)
+diff --git a/src/video_core/renderer_vulkan/vk_ocarina_camera_motion.cpp b/src/video_core/renderer_vulkan/vk_ocarina_camera_motion.cpp
+index de1a0ab..e33a232 100644
+--- a/src/video_core/renderer_vulkan/vk_ocarina_camera_motion.cpp
++++ b/src/video_core/renderer_vulkan/vk_ocarina_camera_motion.cpp
+@@ -22,6 +22,10 @@
+ #include "video_core/host_shaders/ocarina_dlss_effects_comp_spv.h"
+ #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+ #ifdef EGLANTINE_STREAMLINE
++#include "video_core/vulkan_common/vulkan.h"
++// Linux build patch: X11 defines (as in present/layer.cpp), which nvdrv's NvResult uses.
++#undef Success
++#undef BadValue
+ #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
+ #include "video_core/vulkan_common/streamline.h"
+ #endif
+diff --git a/src/video_core/renderer_vulkan/vk_streamline_dlss_linux.cpp b/src/video_core/renderer_vulkan/vk_streamline_dlss_linux.cpp
+new file mode 100644
+index 0000000..78165b9
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/vk_streamline_dlss_linux.cpp
+@@ -0,0 +1,436 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Linux build patch: NVIDIA DLSS in place of a game's DLSS evaluation, through the Fritchii DLSS
++// bridge (NVIDIA NGX; see vulkan_common/streamline_linux.cpp). The Windows version of this file
++// does the same through NVIDIA Streamline.
++
++#include <array>
++#include <atomic>
++#include <cstdlib>
++#include <optional>
++#include <string_view>
++
++#include "common/logging.h"
++#include "common/settings.h"
++#include "video_core/dlss_mode.h"
++#include "video_core/renderer_base.h"
++#include "video_core/renderer_vulkan/vk_scheduler.h"
++#include "video_core/renderer_vulkan/vk_streamline_dlss.h"
++#include "video_core/vulkan_common/streamline.h"
++#include "video_core/vulkan_common/streamline_linux.h"
++#include "video_core/vulkan_common/vulkan_device.h"
++#include "video_core/vulkan_common/vulkan_memory_allocator.h"
++
++namespace Vulkan {
++namespace {
++
++constexpr VkFormat OUTPUT_FORMAT = VK_FORMAT_R16G16B16A16_SFLOAT;
++// DLSS writes the output as a storage image; it is cleared when an evaluation fails.
++constexpr VkImageUsageFlags OUTPUT_USAGE = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
++                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                                           VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++
++// NGX values (DLSS Programming Guide).
++constexpr int32_t QUALITY_PERFORMANCE = 0;
++constexpr int32_t QUALITY_BALANCED = 1;
++constexpr int32_t QUALITY_QUALITY = 2;
++constexpr int32_t QUALITY_ULTRA_PERFORMANCE = 3;
++constexpr int32_t QUALITY_DLAA = 5;
++constexpr uint32_t FLAG_HDR = 1u << 0;
++constexpr uint32_t FLAG_MV_LOW_RES = 1u << 1;
++constexpr uint32_t FLAG_DEPTH_INVERTED = 1u << 3;
++constexpr uint32_t FLAG_AUTO_EXPOSURE = 1u << 6;
++constexpr uint32_t PRESET_DEFAULT = 0;
++constexpr uint32_t PRESET_J = 10;
++constexpr uint32_t PRESET_K = 11;
++constexpr uint32_t PRESET_L = 12;
++constexpr uint32_t PRESET_M = 13;
++
++int EnvInt(const char* name, int fallback) {
++    const char* const value = std::getenv(name);
++    return value ? std::atoi(value) : fallback;
++}
++
++std::atomic<u64> evaluations{};
++std::atomic<u32> last_evaluation{}; ///< Mode, requested mode and preset, a byte each
++
++int32_t QualityValue(Settings::NvidiaDlssQuality mode) {
++    using Quality = Settings::NvidiaDlssQuality;
++    switch (mode) {
++    case Quality::Native:
++        return QUALITY_DLAA;
++    case Quality::Quality:
++        return QUALITY_QUALITY;
++    case Quality::Balanced:
++        return QUALITY_BALANCED;
++    case Quality::Performance:
++        return QUALITY_PERFORMANCE;
++    case Quality::UltraPerformance:
++        return QUALITY_ULTRA_PERFORMANCE;
++    case Quality::Automatic:
++        break;
++    }
++    return QUALITY_QUALITY;
++}
++
++// As on Windows: Graphics > DLSS preset, K by default; EDEN_NX2_DLSS_PRESET=J|K|L|M|default wins.
++uint32_t PresetFor(Settings::DlssPreset preset) {
++    const char* const value = std::getenv("EDEN_NX2_DLSS_PRESET");
++    if (value && value[0] >= 'J' && value[0] <= 'M') {
++        return PRESET_J + static_cast<uint32_t>(value[0] - 'J');
++    }
++    if (value && std::string_view{value} == "default") {
++        return PRESET_DEFAULT;
++    }
++    switch (preset) {
++    case Settings::DlssPreset::Default:
++        return PRESET_DEFAULT;
++    case Settings::DlssPreset::J:
++        return PRESET_J;
++    case Settings::DlssPreset::L:
++        return PRESET_L;
++    case Settings::DlssPreset::M:
++        return PRESET_M;
++    case Settings::DlssPreset::K:
++        break;
++    }
++    return PRESET_K;
++}
++
++VkImageMemoryBarrier Barrier(const StreamlineDlssUpscaler::Image& image, VkAccessFlags src_access,
++                             VkAccessFlags dst_access, VkImageLayout old_layout,
++                             VkImageLayout new_layout) {
++    VkImageSubresourceRange range = image.range;
++    range.aspectMask = image.barrier_aspect;
++    return VkImageMemoryBarrier{
++        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++        .pNext = nullptr,
++        .srcAccessMask = src_access,
++        .dstAccessMask = dst_access,
++        .oldLayout = old_layout,
++        .newLayout = new_layout,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .image = image.image,
++        .subresourceRange = range,
++    };
++}
++
++FdbImage BridgeImage(const StreamlineDlssUpscaler::Image& image, VkExtent2D size) {
++    return FdbImage{
++        .view = image.view,
++        .image = image.image,
++        .range = image.range,
++        .format = image.format,
++        .width = size.width,
++        .height = size.height,
++    };
++}
++
++} // Anonymous namespace
++
++StreamlineDlssUpscaler::StreamlineDlssUpscaler(const Device& device_, Scheduler& scheduler_,
++                                               MemoryAllocator& memory_allocator_)
++    : device{device_}, scheduler{scheduler_}, memory_allocator{memory_allocator_} {
++    if (!Streamline::IsDlssAvailable()) {
++        throw vk::Exception(VK_ERROR_FEATURE_NOT_PRESENT);
++    }
++    VkSamplerCreateInfo sampler_info{
++        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
++        .pNext = nullptr,
++        .flags = 0,
++        .magFilter = VK_FILTER_NEAREST,
++        .minFilter = VK_FILTER_NEAREST,
++        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
++        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++        .mipLodBias = 0.0f,
++        .anisotropyEnable = VK_FALSE,
++        .maxAnisotropy = 1.0f,
++        .compareEnable = VK_FALSE,
++        .compareOp = VK_COMPARE_OP_NEVER,
++        .minLod = 0.0f,
++        .maxLod = VK_LOD_CLAMP_NONE,
++        .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
++        .unnormalizedCoordinates = VK_FALSE,
++    };
++    point_sampler = device.GetLogical().CreateSampler(sampler_info);
++    sampler_info.magFilter = VK_FILTER_LINEAR;
++    sampler_info.minFilter = VK_FILTER_LINEAR;
++    linear_sampler = device.GetLogical().CreateSampler(sampler_info);
++}
++
++StreamlineDlssUpscaler::~StreamlineDlssUpscaler() {
++    // Not scheduler.Finish(), as on Windows. The DLSS feature itself goes with Streamline::Stop().
++    void(device.GetLogical().WaitIdle());
++}
++
++void StreamlineDlssUpscaler::CreateOutput(VkExtent2D upscale_size) {
++    if (output_image) {
++        scheduler.Finish(); // the old output may still be in use
++    }
++    output_image = memory_allocator.CreateImage(VkImageCreateInfo{
++        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++        .pNext = nullptr,
++        .flags = 0,
++        .imageType = VK_IMAGE_TYPE_2D,
++        .format = OUTPUT_FORMAT,
++        .extent = {upscale_size.width, upscale_size.height, 1},
++        .mipLevels = 1,
++        .arrayLayers = 1,
++        .samples = VK_SAMPLE_COUNT_1_BIT,
++        .tiling = VK_IMAGE_TILING_OPTIMAL,
++        .usage = OUTPUT_USAGE,
++        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++        .queueFamilyIndexCount = 0,
++        .pQueueFamilyIndices = nullptr,
++        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++    });
++    output_view = device.GetLogical().CreateImageView(VkImageViewCreateInfo{
++        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++        .pNext = nullptr,
++        .flags = 0,
++        .image = *output_image,
++        .viewType = VK_IMAGE_VIEW_TYPE_2D,
++        .format = OUTPUT_FORMAT,
++        .components{},
++        .subresourceRange{
++            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++            .baseMipLevel = 0,
++            .levelCount = 1,
++            .baseArrayLayer = 0,
++            .layerCount = 1,
++        },
++    });
++    scheduler.RequestOutsideRenderPassOperationContext();
++    scheduler.Record([image = *output_image](vk::CommandBuffer cmdbuf) {
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
++                               VkImageMemoryBarrier{
++                                   .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++                                   .pNext = nullptr,
++                                   .srcAccessMask = 0,
++                                   .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++                                   .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++                                   .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                                   .image = image,
++                                   .subresourceRange{
++                                       .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++                                       .baseMipLevel = 0,
++                                       .levelCount = 1,
++                                       .baseArrayLayer = 0,
++                                       .layerCount = 1,
++                                   },
++                               });
++    });
++}
++
++bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
++    if (failed) {
++        return false;
++    }
++    const bool extent_changed = !output_image || in.render_size.width != render_extent.width ||
++                                in.render_size.height != render_extent.height ||
++                                in.upscale_size.width != upscale_extent.width ||
++                                in.upscale_size.height != upscale_extent.height;
++    const auto settings = Settings::GetNvidiaDlssRuntimeSettings();
++    const bool options_changed = extent_changed || in.hdr != hdr_input ||
++                                 quality_mode != settings.quality ||
++                                 model_preset != settings.preset;
++    const bool reset = in.reset || options_changed;
++    if (options_changed && !extent_changed) {
++        scheduler.Finish();
++    }
++    if (extent_changed) {
++        CreateOutput(in.upscale_size);
++        render_extent = in.render_size;
++        upscale_extent = in.upscale_size;
++    }
++    hdr_input = in.hdr;
++    quality_mode = settings.quality;
++    model_preset = settings.preset;
++
++    FdbEvaluate evaluate{};
++    evaluate.color = BridgeImage(in.color, in.render_size);
++    evaluate.depth = BridgeImage(in.depth, in.render_size);
++    evaluate.motion = BridgeImage(in.motion_vectors, in.render_size);
++    evaluate.output = FdbImage{
++        .view = *output_view,
++        .image = *output_image,
++        .range{
++            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++            .baseMipLevel = 0,
++            .levelCount = 1,
++            .baseArrayLayer = 0,
++            .layerCount = 1,
++        },
++        .format = OUTPUT_FORMAT,
++        .width = in.upscale_size.width,
++        .height = in.upscale_size.height,
++    };
++    evaluate.render_width = in.render_size.width;
++    evaluate.render_height = in.render_size.height;
++    evaluate.output_width = in.upscale_size.width;
++    evaluate.output_height = in.upscale_size.height;
++    evaluate.preset = PresetFor(settings.preset);
++    evaluate.create_flags = FLAG_MV_LOW_RES;
++    if (in.depth_inverted) {
++        evaluate.create_flags |= FLAG_DEPTH_INVERTED;
++    }
++    if (in.hdr && EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0) {
++        evaluate.create_flags |= FLAG_HDR;
++        if (EnvInt("EDEN_NX2_DLSS_AUTO_EXPOSURE", 1) != 0) {
++            evaluate.create_flags |= FLAG_AUTO_EXPOSURE;
++        }
++    }
++    evaluate.jitter_x = in.jitter[0];
++    evaluate.jitter_y = in.jitter[1];
++    evaluate.mv_scale_x = in.motion_vector_scale[0];
++    evaluate.mv_scale_y = in.motion_vector_scale[1];
++    evaluate.reset = reset ? 1 : 0;
++    scheduler.RequestOutsideRenderPassOperationContext();
++    scheduler.Record([this, in, evaluate, options_changed, requested = settings.quality,
++                      preset_setting = settings.preset,
++                      output_image_handle = *output_image](vk::CommandBuffer cmdbuf) {
++        const Streamline::Bridge& bridge = Streamline::GetBridge();
++        // The DLSS mode: the one asked for when it accepts this render size, as on Windows.
++        bool mode_ok = true;
++        if (options_changed) {
++            namespace Mode = VideoCommon::DlssMode;
++            const auto selection = Mode::Select(
++                requested, {in.render_size.width, in.render_size.height},
++                {in.upscale_size.width, in.upscale_size.height},
++                [&](Settings::NvidiaDlssQuality mode) -> std::optional<Mode::Range> {
++                    Mode::Range range{};
++                    if (!bridge.render_size_range(in.upscale_size.width, in.upscale_size.height,
++                                                  QualityValue(mode), &range.min.width,
++                                                  &range.min.height, &range.max.width,
++                                                  &range.max.height)) {
++                        return std::nullopt;
++                    }
++                    return range;
++                });
++            if (selection.fallback) {
++                const Mode::Range range = selection.requested_range.value_or(Mode::Range{});
++                LOG_WARNING(Render_Vulkan,
++                            "NVIDIA DLSS requested {} but using {} for {}x{} -> {}x{}; requested "
++                            "range {}x{} to {}x{} (query {})",
++                            Settings::CanonicalizeEnum(requested),
++                            selection.mode ? Settings::CanonicalizeEnum(*selection.mode)
++                                           : "FSR 3.1",
++                            in.render_size.width, in.render_size.height, in.upscale_size.width,
++                            in.upscale_size.height, range.min.width, range.min.height,
++                            range.max.width, range.max.height,
++                            selection.requested_range ? "supported" : "unavailable");
++            }
++            if (selection.mode) {
++                evaluated_mode = *selection.mode;
++                LOG_INFO(Render_Vulkan, "NVIDIA DLSS (NGX): {}x{} -> {}x{}, mode {}, preset {}, {}",
++                         in.render_size.width, in.render_size.height, in.upscale_size.width,
++                         in.upscale_size.height, Settings::CanonicalizeEnum(*selection.mode),
++                         evaluate.preset,
++                         (evaluate.create_flags & FLAG_HDR) != 0 ? "HDR" : "LDR");
++            } else {
++                LOG_WARNING(Render_Vulkan, "No NVIDIA DLSS mode accepts {}x{} -> {}x{}",
++                            in.render_size.width, in.render_size.height, in.upscale_size.width,
++                            in.upscale_size.height);
++                mode_ok = false;
++            }
++        }
++        FdbEvaluate frame = evaluate;
++        frame.quality = QualityValue(evaluated_mode);
++        constexpr VkAccessFlags WRITES =
++            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
++            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
++        const std::array to_read{
++            Barrier(in.color, WRITES, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
++                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
++            Barrier(in.depth, WRITES, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
++                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
++            Barrier(in.motion_vectors, WRITES, VK_ACCESS_SHADER_READ_BIT,
++                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
++        };
++        const std::array to_general{
++            Barrier(in.color, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | WRITES,
++                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
++            Barrier(in.depth, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | WRITES,
++                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
++            Barrier(in.motion_vectors, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | WRITES,
++                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
++        };
++        const VkMemoryBarrier output_written{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, to_read);
++        const bool evaluated = mode_ok && bridge.evaluate(*cmdbuf, &frame) != 0;
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, output_written, {},
++                               to_general);
++        if (evaluated) {
++            last_evaluation.store(static_cast<u32>(evaluated_mode) |
++                                      (static_cast<u32>(requested) << 8) |
++                                      (static_cast<u32>(preset_setting) << 16),
++                                  std::memory_order_relaxed);
++            evaluations.fetch_add(1, std::memory_order_release);
++            return;
++        }
++        if (!failed.exchange(true)) {
++            LOG_ERROR(Render_Vulkan, "NVIDIA DLSS evaluation failed ({}); using FSR 3.1",
++                      bridge.last_error());
++        }
++        // A black frame instead of stale output; later frames use FSR 3.1.
++        const VkImageSubresourceRange range{
++            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++            .baseMipLevel = 0,
++            .levelCount = 1,
++            .baseArrayLayer = 0,
++            .layerCount = 1,
++        };
++        const auto barrier = [&](VkAccessFlags src_access, VkAccessFlags dst_access) {
++            return VkImageMemoryBarrier{
++                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = src_access,
++                .dstAccessMask = dst_access,
++                .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
++                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .image = output_image_handle,
++                .subresourceRange = range,
++            };
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                               0,
++                               barrier(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
++                                       VK_ACCESS_TRANSFER_WRITE_BIT));
++        cmdbuf.ClearColorImage(output_image_handle, VK_IMAGE_LAYOUT_GENERAL, VkClearColorValue{},
++                               range);
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                               0, barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT));
++    });
++    // DLSS binds its own pipelines and descriptors on the command buffer.
++    scheduler.InvalidateState();
++    return true;
++}
++
++VideoCore::DlssStatus StreamlineDlssUpscaler::Status() {
++    const u64 count = evaluations.load(std::memory_order_acquire);
++    const u32 last = last_evaluation.load(std::memory_order_relaxed);
++    return {
++        .evaluations = count,
++        .mode = static_cast<Settings::NvidiaDlssQuality>(last & 0xff),
++        .requested = static_cast<Settings::NvidiaDlssQuality>((last >> 8) & 0xff),
++        .preset = static_cast<Settings::DlssPreset>((last >> 16) & 0xff),
++    };
++}
++
++} // namespace Vulkan
+diff --git a/src/video_core/vulkan_common/fritchii_dlss_bridge.h b/src/video_core/vulkan_common/fritchii_dlss_bridge.h
+new file mode 100644
+index 0000000..ac77136
+--- /dev/null
++++ b/src/video_core/vulkan_common/fritchii_dlss_bridge.h
+@@ -0,0 +1,87 @@
++// SPDX-FileCopyrightText: Copyright 2026 Fritchii-linux contributors
++// SPDX-License-Identifier: MIT
++
++// The Fritchii DLSS bridge: a small C interface between Fritchii (GPL) and NVIDIA's DLSS SDK.
++//
++// Fritchii only loads the bridge at run time (dlopen) and never contains NVIDIA code. The bridge
++// itself is linked on the user's own PC, from this MIT-licensed code and the NVIDIA DLSS SDK
++// files the user downloads from NVIDIA (Settings > Graphics > Install DLSS), under NVIDIA's license.
++
++#pragma once
++
++#include <stdint.h>
++#include <vulkan/vulkan.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define FDB_ABI_VERSION 2u
++
++typedef struct FdbImage {
++    VkImageView view;
++    VkImage image;
++    VkImageSubresourceRange range;
++    VkFormat format;
++    uint32_t width;
++    uint32_t height;
++} FdbImage;
++
++typedef struct FdbEvaluate {
++    FdbImage color;  ///< Jittered colour at the render size (sampled-image state)
++    FdbImage depth;  ///< Depth at the render size (sampled-image state)
++    FdbImage motion; ///< Motion vectors at the render size (sampled-image state)
++    FdbImage output; ///< Output at the upscale size (storage-image state)
++    uint32_t render_width;
++    uint32_t render_height;
++    uint32_t output_width;
++    uint32_t output_height;
++    int32_t quality;       ///< 0 performance, 1 balanced, 2 quality, 3 ultra performance, 5 DLAA
++    uint32_t preset;       ///< 0 default, 10..13 = presets J..M
++    uint32_t create_flags; ///< 1 HDR, 2 low-res motion vectors, 4 jittered MVs, 8 inverted depth,
++                           ///< 64 auto exposure
++    float jitter_x;        ///< Sample offset in render pixels
++    float jitter_y;
++    float mv_scale_x; ///< Turns a motion vector into render pixels
++    float mv_scale_y;
++    int32_t reset;
++} FdbEvaluate;
++
++/// level: 0 info, 1 warning, 2 error
++typedef void (*FdbLogFn)(int level, const char* message);
++
++/// FDB_ABI_VERSION of the bridge.
++uint32_t fdb_abi_version(void);
++
++/// The Vulkan instance and device extensions DLSS needs. The names stay valid while the bridge is
++/// loaded. Returns 1 on success.
++int fdb_required_extensions(uint32_t* instance_count, const char* const** instance_names,
++                            uint32_t* device_count, const char* const** device_names);
++
++/// Starts NGX on the renderer's device and checks that DLSS is available. data_dir is a writable
++/// folder for NGX's own files; model_dir holds libnvidia-ngx-dlss.so.*. Returns 1 when DLSS can
++/// run, otherwise 0 (fdb_last_error says why).
++int fdb_init(VkInstance instance, VkPhysicalDevice physical_device, VkDevice device,
++             PFN_vkGetInstanceProcAddr get_instance_proc_addr,
++             PFN_vkGetDeviceProcAddr get_device_proc_addr, const char* data_dir_utf8,
++             const char* model_dir_utf8, FdbLogFn log);
++
++/// The render sizes DLSS accepts for an output size in a quality mode (see FdbEvaluate::quality).
++/// Returns 1 on success.
++int fdb_render_size_range(uint32_t output_width, uint32_t output_height, int32_t quality,
++                          uint32_t* min_width, uint32_t* min_height, uint32_t* max_width,
++                          uint32_t* max_height);
++
++/// Records one DLSS evaluation (creating or recreating the DLSS feature when its settings change).
++/// Returns 1 on success.
++int fdb_evaluate(VkCommandBuffer command_buffer, const FdbEvaluate* evaluate);
++
++/// Releases DLSS and shuts NGX down. The device must be idle.
++void fdb_shutdown(void);
++
++/// The last failure, in English.
++const char* fdb_last_error(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/video_core/vulkan_common/streamline_linux.cpp b/src/video_core/vulkan_common/streamline_linux.cpp
+new file mode 100644
+index 0000000..e1bbac4
+--- /dev/null
++++ b/src/video_core/vulkan_common/streamline_linux.cpp
+@@ -0,0 +1,245 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Linux build patch: NVIDIA DLSS on Linux, through the Fritchii DLSS bridge.
++//
++// NVIDIA Streamline only exists for Windows. On Linux DLSS is NVIDIA's NGX, which ships with the
++// NVIDIA driver (libnvidia-ngx.so.1). Applications reach it through libnvsdk_ngx.a from NVIDIA's
++// DLSS SDK, under NVIDIA's license, which can't be part of this GPL program. So nothing of NVIDIA's
++// is built in here: Settings > Graphics > Install DLSS downloads NVIDIA's SDK files from NVIDIA,
++// and links them on the user's PC with the MIT-licensed bridge into libfritchii_dlss_bridge.so,
++// which this file loads at run time. This keeps the Streamline functions' meaning, so the renderer
++// is unchanged.
++
++#include <algorithm>
++#include <cstdlib>
++#include <dlfcn.h>
++#include <string>
++#include <string_view>
++
++#include "common/fs/fs.h"
++#include "common/fs/path_util.h"
++#include "common/logging.h"
++#include "common/settings.h"
++#include "video_core/vulkan_common/fritchii_dlss_bridge.h"
++#include "video_core/vulkan_common/streamline.h"
++#include "video_core/vulkan_common/streamline_linux.h"
++
++namespace Vulkan::Streamline {
++namespace {
++
++constexpr const char* BRIDGE = "libfritchii_dlss_bridge.so";
++constexpr const char* MODEL_PREFIX = "libnvidia-ngx-dlss.so.";
++
++struct State {
++    void* module{};
++    Bridge bridge{};
++    bool started{};
++    bool attached{};
++    std::vector<std::string> instance_extensions;
++    std::vector<std::string> device_extensions;
++};
++
++State& GetState() {
++    static State state;
++    return state;
++}
++
++void LogFromBridge(int level, const char* message) {
++    std::string_view text{message ? message : ""};
++    switch (level) {
++    case 2:
++        LOG_ERROR(Render_Vulkan, "DLSS bridge: {}", text);
++        break;
++    case 1:
++        LOG_WARNING(Render_Vulkan, "DLSS bridge: {}", text);
++        break;
++    default:
++        LOG_INFO(Render_Vulkan, "DLSS bridge: {}", text);
++        break;
++    }
++}
++
++template <typename T>
++bool Resolve(void* module, T& function, const char* name) {
++    function = reinterpret_cast<T>(dlsym(module, name));
++    return function != nullptr;
++}
++
++} // Anonymous namespace
++
++std::filesystem::path UserFolder() {
++    return Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) / "nvidia-dlss";
++}
++
++DlssFiles FindDlssFiles() {
++    DlssFiles files;
++    files.folder = UserFolder();
++    std::error_code ec;
++    if (std::filesystem::is_regular_file(files.folder / BRIDGE, ec)) {
++        files.interposer = files.folder / BRIDGE;
++    }
++    // The newest libnvidia-ngx-dlss.so.<version> in the folder.
++    for (const auto& entry : std::filesystem::directory_iterator(files.folder, ec)) {
++        const std::string name = entry.path().filename().string();
++        if (!name.starts_with(MODEL_PREFIX) || !entry.is_regular_file(ec)) {
++            continue;
++        }
++        const std::string version = name.substr(std::string_view{MODEL_PREFIX}.size());
++        if (files.model.empty() || version > files.model_version) {
++            files.model = entry.path();
++            files.model_version = version;
++        }
++    }
++    return files;
++}
++
++bool IsStreamlineModule(const std::filesystem::path&) {
++    return false;
++}
++
++bool IsSignedByNvidia(const std::filesystem::path&) {
++    return false;
++}
++
++const Bridge* LoadBridge(std::string* error) {
++    State& state = GetState();
++    if (state.module) {
++        return &state.bridge;
++    }
++    const DlssFiles files = FindDlssFiles();
++    const auto fail = [&](std::string message) -> const Bridge* {
++        if (error) {
++            *error = std::move(message);
++        }
++        return nullptr;
++    };
++    if (files.interposer.empty()) {
++        return fail("DLSS is not installed (Settings > Graphics > Install DLSS)");
++    }
++    if (files.model.empty()) {
++        return fail("NVIDIA's DLSS model (libnvidia-ngx-dlss.so) is missing; install DLSS again");
++    }
++    // RTLD_NODELETE: NGX keeps threads and callbacks in it for the rest of the run.
++    void* const module = dlopen(Common::FS::PathToUTF8String(files.interposer).c_str(),
++                                RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
++    if (!module) {
++        const char* const message = dlerror();
++        return fail(std::string{"The DLSS bridge did not load: "} + (message ? message : "?"));
++    }
++    Bridge bridge{};
++    const bool resolved = Resolve(module, bridge.abi_version, "fdb_abi_version") &&
++                          Resolve(module, bridge.required_extensions, "fdb_required_extensions") &&
++                          Resolve(module, bridge.init, "fdb_init") &&
++                          Resolve(module, bridge.render_size_range, "fdb_render_size_range") &&
++                          Resolve(module, bridge.evaluate, "fdb_evaluate") &&
++                          Resolve(module, bridge.shutdown, "fdb_shutdown") &&
++                          Resolve(module, bridge.last_error, "fdb_last_error");
++    if (!resolved || bridge.abi_version() != FDB_ABI_VERSION) {
++        dlclose(module);
++        return fail("The installed DLSS bridge is from another version; install DLSS again");
++    }
++    state.module = module;
++    state.bridge = bridge;
++    return &state.bridge;
++}
++
++bool Start() {
++    State& state = GetState();
++    if (state.started) {
++        return true;
++    }
++    if (!Settings::values.nvidia_dlss.GetValue()) {
++        return false;
++    }
++    std::string error;
++    const Bridge* const bridge = LoadBridge(&error);
++    if (!bridge) {
++        LOG_WARNING(Render_Vulkan, "NVIDIA DLSS is on, but {}; using FSR 3.1", error);
++        return false;
++    }
++    u32 instance_count = 0;
++    u32 device_count = 0;
++    const char* const* instance_names = nullptr;
++    const char* const* device_names = nullptr;
++    if (!bridge->required_extensions(&instance_count, &instance_names, &device_count,
++                                     &device_names)) {
++        LOG_WARNING(Render_Vulkan, "NVIDIA DLSS: {}; using FSR 3.1", bridge->last_error());
++        return false;
++    }
++    state.instance_extensions.assign(instance_names, instance_names + instance_count);
++    state.device_extensions.assign(device_names, device_names + device_count);
++    // NGX names the EXT buffer device address extension; the KHR one (core in Vulkan 1.2) is what
++    // the renderer uses, and the two can't both be enabled.
++    for (std::string& name : state.device_extensions) {
++        if (name == VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) {
++            name = VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME;
++        }
++    }
++    const DlssFiles files = FindDlssFiles();
++    LOG_INFO(Render_Vulkan, "NVIDIA DLSS bridge loaded from {} (DLSS {})",
++             Common::FS::PathToUTF8String(files.folder), files.model_version);
++    state.started = true;
++    return true;
++}
++
++bool WantsDevice() {
++    const State& state = GetState();
++    return state.started && !state.attached;
++}
++
++std::vector<std::string> InstanceExtensions() {
++    const State& state = GetState();
++    return state.started ? state.instance_extensions : std::vector<std::string>{};
++}
++
++std::vector<std::string> DeviceExtensions() {
++    const State& state = GetState();
++    return state.started ? state.device_extensions : std::vector<std::string>{};
++}
++
++bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
++                  u32 /*graphics_family*/, vk::DeviceDispatch& dld) {
++    State& state = GetState();
++    if (!WantsDevice()) {
++        return false;
++    }
++    const std::filesystem::path folder = UserFolder();
++    const std::filesystem::path data = folder / "ngx-data";
++    void(Common::FS::CreateDirs(data));
++    if (!state.bridge.init(instance, physical, device, dld.vkGetInstanceProcAddr,
++                           dld.vkGetDeviceProcAddr, Common::FS::PathToUTF8String(data).c_str(),
++                           Common::FS::PathToUTF8String(folder).c_str(), LogFromBridge)) {
++        LOG_WARNING(Render_Vulkan, "NVIDIA DLSS can't run: {}; using FSR 3.1",
++                    state.bridge.last_error());
++        state.started = false;
++        return false;
++    }
++    state.attached = true;
++    LOG_INFO(Render_Vulkan, "NVIDIA DLSS is available (NGX, Linux)");
++    return true;
++}
++
++bool IsDlssAvailable() {
++    const State& state = GetState();
++    return state.started && state.attached;
++}
++
++void Stop() {
++    State& state = GetState();
++    if (!state.started) {
++        return;
++    }
++    if (state.attached) {
++        state.bridge.shutdown();
++    }
++    state.started = false;
++    state.attached = false;
++    LOG_INFO(Render_Vulkan, "NVIDIA DLSS stopped");
++}
++
++const Bridge& GetBridge() {
++    return GetState().bridge;
++}
++
++} // namespace Vulkan::Streamline
+diff --git a/src/video_core/vulkan_common/streamline_linux.h b/src/video_core/vulkan_common/streamline_linux.h
+new file mode 100644
+index 0000000..7e2866f
+--- /dev/null
++++ b/src/video_core/vulkan_common/streamline_linux.h
+@@ -0,0 +1,30 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Linux build patch: the Fritchii DLSS bridge's functions (see streamline_linux.cpp).
++
++#pragma once
++
++#include <string>
++
++#include "video_core/vulkan_common/fritchii_dlss_bridge.h"
++
++namespace Vulkan::Streamline {
++
++struct Bridge {
++    decltype(&fdb_abi_version) abi_version{};
++    decltype(&fdb_required_extensions) required_extensions{};
++    decltype(&fdb_init) init{};
++    decltype(&fdb_render_size_range) render_size_range{};
++    decltype(&fdb_evaluate) evaluate{};
++    decltype(&fdb_shutdown) shutdown{};
++    decltype(&fdb_last_error) last_error{};
++};
++
++/// Loads the installed bridge (once). Returns null and says why when it can't.
++const Bridge* LoadBridge(std::string* error = nullptr);
++
++/// The loaded bridge; only valid after Start() succeeded.
++const Bridge& GetBridge();
++
++} // namespace Vulkan::Streamline
+diff --git a/src/yuzu/CMakeLists.txt b/src/yuzu/CMakeLists.txt
+index 3528b26..41d0d81 100644
+--- a/src/yuzu/CMakeLists.txt
++++ b/src/yuzu/CMakeLists.txt
+@@ -78,6 +78,7 @@ add_executable(yuzu
+     configuration/amd_fsr4_panel.h
+     configuration/nvidia_dlss_panel.cpp
+     configuration/nvidia_dlss_panel.h
++    configuration/nvidia_dlss_panel_linux.cpp
+     configuration/configure_graphics.ui
+     configuration/configure_graphics_advanced.cpp
+     configuration/configure_graphics_advanced.h
+diff --git a/src/yuzu/configuration/configure_graphics.cpp b/src/yuzu/configuration/configure_graphics.cpp
+index 36ba1f3..e9e7405 100644
+--- a/src/yuzu/configuration/configure_graphics.cpp
++++ b/src/yuzu/configuration/configure_graphics.cpp
+@@ -239,6 +239,15 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
+             continue;
+         }
+ #endif
++#ifdef EGLANTINE_DLSS_BRIDGE
++        // Linux build patch: NVIDIA DLSS needs NVIDIA's own driver.
++        if ((setting->Id() == Settings::values.nvidia_dlss.Id() ||
++             setting->Id() == Settings::values.nvidia_dlss_quality.Id() ||
++             setting->Id() == Settings::values.nvidia_dlss_preset.Id()) &&
++            !NvidiaDlssPanel::HasNvidiaDriver()) {
++            continue;
++        }
++#endif
+ 
+         ConfigurationShared::Widget* widget = [&]() {
+             if (setting->Id() == Settings::values.fsr_sharpening_slider.Id()) {
+@@ -342,7 +351,15 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
+ 
+             hold_graphics.emplace(setting->Id(), widget);
+ #endif
+-#ifdef EGLANTINE_STREAMLINE
++#ifdef EGLANTINE_DLSS_BRIDGE
++        } else if (setting->Id() == Settings::values.nvidia_dlss.Id()) {
++            // Linux build patch: "Install DLSS" next to the checkbox.
++            nvidia_dlss_checkbox = widget->checkbox;
++            NvidiaDlssPanel* panel = new NvidiaDlssPanel(widget, widget->checkbox);
++            QBoxLayout* row = qobject_cast<QBoxLayout*>(widget->layout());
++            row->insertWidget(1, panel);
++            hold_graphics.emplace(setting->Id(), widget);
++#elif defined(EGLANTINE_STREAMLINE)
+         } else if (setting->Id() == Settings::values.nvidia_dlss.Id()) {
+             nvidia_dlss_checkbox = widget->checkbox;
+             // NVIDIA's files and a download button under the checkbox.
+diff --git a/src/yuzu/configuration/nvidia_dlss_panel.cpp b/src/yuzu/configuration/nvidia_dlss_panel.cpp
+index 45a2504..01dce62 100644
+--- a/src/yuzu/configuration/nvidia_dlss_panel.cpp
++++ b/src/yuzu/configuration/nvidia_dlss_panel.cpp
+@@ -1,7 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+-#ifdef EGLANTINE_STREAMLINE
++#if defined(EGLANTINE_STREAMLINE) && !defined(EGLANTINE_DLSS_BRIDGE)
+ 
+ #include "common/httplib.h"
+ 
+diff --git a/src/yuzu/configuration/nvidia_dlss_panel.h b/src/yuzu/configuration/nvidia_dlss_panel.h
+index 1ab3917..5589f5e 100644
+--- a/src/yuzu/configuration/nvidia_dlss_panel.h
++++ b/src/yuzu/configuration/nvidia_dlss_panel.h
+@@ -6,7 +6,7 @@
+ 
+ #pragma once
+ 
+-#ifdef EGLANTINE_STREAMLINE
++#if defined(EGLANTINE_STREAMLINE) && !defined(EGLANTINE_DLSS_BRIDGE)
+ 
+ #include <QWidget>
+ 
+@@ -31,4 +31,37 @@ private:
+     QPushButton* folder_button;
+ };
+ 
++#elif defined(EGLANTINE_DLSS_BRIDGE)
++
++// Linux build patch: the "Install DLSS" button and status next to the NVIDIA DLSS checkbox
++// (nvidia_dlss_panel_linux.cpp).
++
++#include <QWidget>
++
++class QCheckBox;
++class QLabel;
++class QPushButton;
++
++class NvidiaDlssPanel : public QWidget {
++public:
++    NvidiaDlssPanel(QWidget* parent, QCheckBox* checkbox);
++
++    void Refresh();
++
++    /// Whether NVIDIA's own driver is running (DLSS needs it).
++    static bool HasNvidiaDriver();
++    /// Whether the DLSS bridge and NVIDIA's DLSS model are installed.
++    static bool IsInstalled();
++
++protected:
++    void showEvent(QShowEvent* event) override;
++
++private:
++    void Install();
++
++    QCheckBox* checkbox;
++    QLabel* status_label;
++    QPushButton* install_button;
++};
++
+ #endif
+diff --git a/src/yuzu/configuration/nvidia_dlss_panel_linux.cpp b/src/yuzu/configuration/nvidia_dlss_panel_linux.cpp
+new file mode 100644
+index 0000000..e7d12a8
+--- /dev/null
++++ b/src/yuzu/configuration/nvidia_dlss_panel_linux.cpp
+@@ -0,0 +1,426 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Linux build patch: the "Install DLSS" button next to the NVIDIA DLSS setting.
++//
++// It downloads NVIDIA's DLSS SDK files (the NGX library and the DLSS model) straight from NVIDIA's
++// DLSS repository on GitHub, once the user has read and accepted NVIDIA's license, checks them
++// against known checksums, and links the MIT-licensed Fritchii DLSS bridge with them on this PC,
++// using the linker that ships in the AppImage. Nothing of NVIDIA's ships with Fritchii.
++
++#ifdef EGLANTINE_DLSS_BRIDGE
++
++#include "common/httplib.h"
++
++#include <array>
++#include <cstdio>
++#include <dlfcn.h>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <functional>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include <QApplication>
++#include <QCheckBox>
++#include <QCryptographicHash>
++#include <QDesktopServices>
++#include <QDialog>
++#include <QDialogButtonBox>
++#include <QHBoxLayout>
++#include <QLabel>
++#include <QMessageBox>
++#include <QPlainTextEdit>
++#include <QProcess>
++#include <QProgressDialog>
++#include <QPushButton>
++#include <QUrl>
++#include <QVBoxLayout>
++#include <fmt/format.h>
++
++#include "common/fs/path_util.h"
++#include "common/logging.h"
++#include "video_core/vulkan_common/fritchii_dlss_bridge.h"
++#include "video_core/vulkan_common/streamline.h"
++#include "yuzu/configuration/nvidia_dlss_panel.h"
++
++namespace {
++
++namespace Streamline = Vulkan::Streamline;
++
++// NVIDIA's DLSS SDK, pinned to the v310.9.16 release commit so the checksums below hold.
++constexpr const char* SDK_VERSION = "310.9.16";
++constexpr const char* SDK_HOST = "https://raw.githubusercontent.com";
++constexpr const char* SDK_PATH = "/NVIDIA/DLSS/9981c6350dc58c0ce21f024fd65e31e851c31689/";
++constexpr const char* SDK_PAGE = "https://github.com/NVIDIA/DLSS/tree/v310.9.16";
++
++struct SdkFile {
++    const char* path;      ///< In NVIDIA's repository
++    const char* name;      ///< Saved as
++    const char* sha256;
++    qint64 size;
++};
++
++constexpr SdkFile LICENSE{"LICENSE.txt", "NVIDIA-DLSS-SDK-LICENSE.txt",
++                          "d4216e39ebef5f9b50a6712ebb37beeb5379862a67733a9999c651f21592aaf0",
++                          26620};
++constexpr SdkFile NGX_LIBRARY{"lib/Linux_x86_64/libnvsdk_ngx.a", "libnvsdk_ngx.a",
++                              "d3c50bb0d9624fc35e502a8e929b8fc1e2b505017ebdb84c0d5b627e11a235df",
++                              89002};
++constexpr SdkFile DLSS_MODEL{"lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.310.9.16",
++                             "libnvidia-ngx-dlss.so.310.9.16",
++                             "30982c937afed85c96b8d313323de9a650a2eec6de1bb0f714b21750f4ce98f6",
++                             59481944};
++
++constexpr const char* BRIDGE = "libfritchii_dlss_bridge.so";
++
++QString Tr(const char* text) {
++    return QCoreApplication::translate("NvidiaDlssPanel", text);
++}
++
++QString PathText(const std::filesystem::path& path) {
++    return QString::fromStdString(Common::FS::PathToUTF8String(path));
++}
++
++/// The linker and the bridge object that ship in the AppImage (usr/bin/mold and
++/// usr/share/fritchii-dlss/fritchii_dlss_bridge.o), or FRITCHII_DLSS_TOOLS for development.
++struct Tools {
++    std::filesystem::path linker;
++    std::filesystem::path bridge_object;
++};
++
++std::optional<Tools> FindTools() {
++    std::vector<std::filesystem::path> dirs;
++    if (const char* const env = std::getenv("FRITCHII_DLSS_TOOLS")) {
++        dirs.emplace_back(env);
++    }
++    const std::filesystem::path bin =
++        std::filesystem::path{QCoreApplication::applicationDirPath().toStdString()};
++    dirs.push_back(bin / ".." / "share" / "fritchii-dlss");
++    std::error_code ec;
++    for (const std::filesystem::path& dir : dirs) {
++        const std::filesystem::path object = dir / "fritchii_dlss_bridge.o";
++        for (const std::filesystem::path& linker : {dir / "mold", bin / "mold"}) {
++            if (std::filesystem::is_regular_file(object, ec) &&
++                std::filesystem::is_regular_file(linker, ec)) {
++                return Tools{linker, object};
++            }
++        }
++    }
++    return std::nullopt;
++}
++
++/// The system's CA certificates, so HTTPS works whichever distribution the AppImage runs on.
++std::string CaBundle() {
++    std::error_code ec;
++    for (const char* path :
++         {"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
++          "/etc/ssl/ca-bundle.pem", "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
++          "/etc/ssl/cert.pem"}) {
++        if (std::filesystem::is_regular_file(path, ec)) {
++            return path;
++        }
++    }
++    return {};
++}
++
++/// Downloads one SDK file into `target`, checking its size and SHA-256.
++bool Download(const SdkFile& file, const std::filesystem::path& target,
++              const std::function<bool(qint64)>& progress, std::string& error) {
++    httplib::Client client(SDK_HOST);
++    client.set_connection_timeout(30);
++    client.set_read_timeout(60);
++    client.set_follow_location(true);
++    if (const std::string ca = CaBundle(); !ca.empty()) {
++        client.set_ca_cert_path(ca);
++    }
++    std::ofstream out(target, std::ios::binary | std::ios::trunc);
++    if (!out) {
++        error = "could not write " + Common::FS::PathToUTF8String(target);
++        return false;
++    }
++    QCryptographicHash hash(QCryptographicHash::Sha256);
++    qint64 received = 0;
++    bool canceled = false;
++    const auto result = client.Get(
++        std::string{SDK_PATH} + file.path,
++        [&](const char* data, size_t length) {
++            out.write(data, static_cast<std::streamsize>(length));
++            hash.addData(QByteArrayView{data, static_cast<qsizetype>(length)});
++            received += static_cast<qint64>(length);
++            if (!progress(received)) {
++                canceled = true;
++                return false;
++            }
++            return static_cast<bool>(out);
++        });
++    out.close();
++    if (canceled) {
++        error = "canceled";
++        return false;
++    }
++    if (!result) {
++        error = httplib::to_string(result.error());
++        return false;
++    }
++    if (result->status != 200) {
++        error = fmt::format("HTTP {} for {}", result->status, file.path);
++        return false;
++    }
++    if (received != file.size || hash.result().toHex().toStdString() != file.sha256) {
++        error = fmt::format("{} from NVIDIA does not match the expected file", file.name);
++        return false;
++    }
++    return true;
++}
++
++/// Whether the bridge loads and is this build's version.
++bool CheckBridge(const std::filesystem::path& path, std::string& error) {
++    void* const module =
++        dlopen(Common::FS::PathToUTF8String(path).c_str(), RTLD_NOW | RTLD_LOCAL);
++    if (!module) {
++        const char* const message = dlerror();
++        error = std::string{"the linked bridge does not load: "} + (message ? message : "?");
++        return false;
++    }
++    const auto version = reinterpret_cast<uint32_t (*)()>(dlsym(module, "fdb_abi_version"));
++    const bool ok = version && version() == FDB_ABI_VERSION;
++    dlclose(module);
++    if (!ok) {
++        error = "the linked bridge is not this build's version";
++    }
++    return ok;
++}
++
++} // Anonymous namespace
++
++bool NvidiaDlssPanel::HasNvidiaDriver() {
++    std::error_code ec;
++    return std::filesystem::exists("/proc/driver/nvidia/version", ec);
++}
++
++bool NvidiaDlssPanel::IsInstalled() {
++    const Streamline::DlssFiles files = Streamline::FindDlssFiles();
++    return !files.interposer.empty() && !files.model.empty();
++}
++
++NvidiaDlssPanel::NvidiaDlssPanel(QWidget* parent, QCheckBox* checkbox_)
++    : QWidget(parent), checkbox{checkbox_} {
++    QHBoxLayout* layout = new QHBoxLayout(this);
++    layout->setContentsMargins(0, 0, 0, 0);
++    layout->setSpacing(8);
++    install_button = new QPushButton(this);
++    status_label = new QLabel(this);
++    status_label->setTextFormat(Qt::RichText);
++    status_label->setOpenExternalLinks(true);
++    layout->addWidget(install_button);
++    layout->addWidget(status_label);
++    connect(install_button, &QPushButton::clicked, this, [this] { Install(); });
++    Refresh();
++}
++
++void NvidiaDlssPanel::showEvent(QShowEvent* event) {
++    Refresh();
++    QWidget::showEvent(event);
++}
++
++void NvidiaDlssPanel::Refresh() {
++    const bool installed = IsInstalled();
++    if (installed) {
++        const Streamline::DlssFiles files = Streamline::FindDlssFiles();
++        status_label->setText(
++            QStringLiteral("<span style=\"color:#2ea043\">&#10004;</span> ") +
++            Tr("DLSS %1 installed").arg(QString::fromStdString(files.model_version)));
++        install_button->setText(Tr("Reinstall..."));
++    } else {
++        status_label->setText(Tr("Needs NVIDIA's DLSS files (about 60 MB)"));
++        install_button->setText(Tr("Install DLSS..."));
++    }
++    status_label->setToolTip(Tr("Folder: %1").arg(PathText(Streamline::UserFolder())));
++    // Can't be turned on before it's installed (unless it already was).
++    if (checkbox) {
++        checkbox->setEnabled(installed || checkbox->isChecked());
++    }
++}
++
++void NvidiaDlssPanel::Install() {
++    const auto fail = [this](const std::string& error) {
++        LOG_ERROR(Frontend, "NVIDIA DLSS install failed: {}", error);
++        QMessageBox::warning(this, Tr("NVIDIA DLSS"),
++                             Tr("NVIDIA DLSS could not be installed: %1")
++                                 .arg(QString::fromStdString(error)));
++        Refresh();
++    };
++    const std::optional<Tools> tools = FindTools();
++    if (!tools) {
++        fail("this build has no DLSS installer files (run the AppImage, not an extracted copy "
++             "without usr/share/fritchii-dlss)");
++        return;
++    }
++    const std::filesystem::path folder = Streamline::UserFolder();
++    const std::filesystem::path work = folder / ".install";
++    std::error_code ec;
++    std::filesystem::remove_all(work, ec);
++    std::filesystem::create_directories(work, ec);
++    if (ec) {
++        fail("could not create " + Common::FS::PathToUTF8String(work));
++        return;
++    }
++
++    // 1. NVIDIA's license, to read and accept first.
++    std::string error;
++    {
++        QProgressDialog busy(Tr("Getting NVIDIA's license..."), QString{}, 0, 0, this);
++        busy.setWindowTitle(Tr("NVIDIA DLSS"));
++        busy.setWindowModality(Qt::WindowModal);
++        busy.setMinimumDuration(0);
++        busy.show();
++        QApplication::processEvents();
++        if (!Download(LICENSE, work / LICENSE.name, [](qint64) { return true; }, error)) {
++            busy.close();
++            fail(error);
++            return;
++        }
++    }
++    QString license_text;
++    {
++        std::ifstream in(work / LICENSE.name, std::ios::binary);
++        license_text = QString::fromStdString(
++            std::string{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}});
++    }
++    QDialog dialog(this);
++    dialog.setWindowTitle(Tr("Install NVIDIA DLSS"));
++    QVBoxLayout* layout = new QVBoxLayout(&dialog);
++    QLabel* intro = new QLabel(
++        Tr("Fritchii will download NVIDIA's DLSS SDK %1 files (the NGX library and the DLSS "
++           "model, about 60 MB) from <a href=\"%2\">NVIDIA's DLSS repository</a> on GitHub, and "
++           "set them up for Fritchii on this PC in %3.<br><br>"
++           "These files are NVIDIA's, under NVIDIA's license below. They are not part of "
++           "Fritchii and are not shared by it. DLSS needs an NVIDIA RTX GPU and NVIDIA's "
++           "driver.")
++            .arg(QString::fromLatin1(SDK_VERSION), QString::fromLatin1(SDK_PAGE),
++                 PathText(folder)),
++        &dialog);
++    intro->setWordWrap(true);
++    intro->setOpenExternalLinks(true);
++    QPlainTextEdit* license = new QPlainTextEdit(license_text, &dialog);
++    license->setReadOnly(true);
++    license->setMinimumSize(640, 380);
++    QCheckBox* accept = new QCheckBox(Tr("I have read and accept NVIDIA's license"), &dialog);
++    QDialogButtonBox* buttons = new QDialogButtonBox(&dialog);
++    QPushButton* install = buttons->addButton(Tr("Install"), QDialogButtonBox::AcceptRole);
++    buttons->addButton(QDialogButtonBox::Cancel);
++    install->setEnabled(false);
++    connect(accept, &QCheckBox::toggled, install, &QPushButton::setEnabled);
++    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
++    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
++    layout->addWidget(intro);
++    layout->addWidget(license, 1);
++    layout->addWidget(accept);
++    layout->addWidget(buttons);
++    if (dialog.exec() != QDialog::Accepted || !accept->isChecked()) {
++        std::filesystem::remove_all(work, ec);
++        return;
++    }
++
++    // 2. NVIDIA's files.
++    const qint64 total = NGX_LIBRARY.size + DLSS_MODEL.size;
++    QProgressDialog progress(Tr("Downloading NVIDIA DLSS..."), Tr("Cancel"), 0, 1000, this);
++    progress.setWindowTitle(Tr("NVIDIA DLSS"));
++    progress.setWindowModality(Qt::WindowModal);
++    progress.setMinimumDuration(0);
++    progress.setValue(0);
++    QApplication::processEvents();
++    qint64 done = 0;
++    for (const SdkFile* file : {&NGX_LIBRARY, &DLSS_MODEL}) {
++        const bool ok = Download(
++            *file, work / file->name,
++            [&](qint64 received) {
++                progress.setValue(static_cast<int>((done + received) * 1000 / total));
++                QApplication::processEvents();
++                return !progress.wasCanceled();
++            },
++            error);
++        if (!ok) {
++            progress.close();
++            std::filesystem::remove_all(work, ec);
++            if (error != "canceled") {
++                fail(error);
++            }
++            return;
++        }
++        done += file->size;
++    }
++    progress.setLabelText(Tr("Setting up NVIDIA DLSS..."));
++    progress.setCancelButton(nullptr);
++    progress.setRange(0, 0);
++    QApplication::processEvents();
++
++    // 3. Link the bridge here, with NVIDIA's library.
++    QProcess linker;
++    linker.setProcessChannelMode(QProcess::MergedChannels);
++    const QStringList arguments{
++        QStringLiteral("-shared"),
++        QStringLiteral("-o"),
++        PathText(work / BRIDGE),
++        QStringLiteral("-soname"),
++        QString::fromLatin1(BRIDGE),
++        QStringLiteral("--gc-sections"),
++        QStringLiteral("--exclude-libs"),
++        QStringLiteral("ALL"),
++        QStringLiteral("-z"),
++        QStringLiteral("now"),
++        PathText(tools->bridge_object),
++        PathText(work / NGX_LIBRARY.name),
++    };
++    linker.start(PathText(tools->linker), arguments);
++    if (!linker.waitForFinished(120000) || linker.exitStatus() != QProcess::NormalExit ||
++        linker.exitCode() != 0) {
++        const std::string output = linker.readAll().toStdString();
++        progress.close();
++        std::filesystem::remove_all(work, ec);
++        fail("linking the DLSS bridge failed: " +
++             (output.empty() ? linker.errorString().toStdString() : output));
++        return;
++    }
++    if (!CheckBridge(work / BRIDGE, error)) {
++        progress.close();
++        std::filesystem::remove_all(work, ec);
++        fail(error);
++        return;
++    }
++
++    // 4. Into place. Older DLSS models go, so the newest is the one used.
++    for (const auto& entry : std::filesystem::directory_iterator(folder, ec)) {
++        const std::string name = entry.path().filename().string();
++        if (name.starts_with("libnvidia-ngx-dlss.so.") && name != DLSS_MODEL.name) {
++            std::filesystem::remove(entry.path(), ec);
++        }
++    }
++    bool moved = true;
++    for (const char* name : {DLSS_MODEL.name, LICENSE.name, BRIDGE}) {
++        std::filesystem::rename(work / name, folder / name, ec);
++        moved = moved && !ec;
++    }
++    std::filesystem::remove_all(work, ec);
++    progress.close();
++    if (!moved) {
++        fail("could not save the files in " + Common::FS::PathToUTF8String(folder));
++        return;
++    }
++    LOG_INFO(Frontend, "NVIDIA DLSS {} installed in {}", SDK_VERSION,
++             Common::FS::PathToUTF8String(folder));
++    if (checkbox) {
++        checkbox->setEnabled(true);
++        checkbox->setChecked(true);
++    }
++    Refresh();
++    QMessageBox::information(
++        this, Tr("NVIDIA DLSS"),
++        Tr("NVIDIA DLSS is installed and turned on. Press OK or Apply to save the setting; it is "
++           "used the next time a game starts."));
++}
++
++#endif
