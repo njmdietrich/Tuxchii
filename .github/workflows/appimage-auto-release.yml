@@ -292,6 +292,43 @@ jobs:
           path: .ccache
           key: ccache-appimage-${{ matrix.tag }}-${{ github.run_id }}
 
+      # AMD FSR 4 on Linux (when fsr4-linux.patch is applied): AMD ships FSR 4 for Windows only, so
+      # build fsr4-vk (github.com/Astyyyyy/fsr4-vk, GPL-3.0), an open Vulkan implementation of
+      # FSR 4.1.1, at a pinned commit. Its shaders and model come from AMD's FidelityFX SDK 2.3.0
+      # upscaler DLL (MIT-licensed by AMD), downloaded from AMD's GitHub and checked by SHA-256.
+      # If this fails the AppImage is still built, without FSR 4 (FSR 3.1 stays available).
+      - name: Build FSR 4 for Linux (fsr4-vk)
+        if: hashFiles('_linux-patches/.github/linux-patches/fsr4-linux.patch') != ''
+        continue-on-error: true
+        env:
+          FSR4_VK_COMMIT: b0125ea9798633750f83ebabbc00279bcb49d8dd
+          AMD_SDK_COMMIT: 60f4ea81909200d8542eca14dccb2628b763a9a3
+          AMD_DLL_SHA256: d0dcccc74a43c44ba435b7a369b456e0970d8a4464e4bd683119b374f2c9fb46
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends libvulkan-dev llvm
+          src="$RUNNER_TEMP/fsr4-vk"
+          git init -q "$src"
+          git -C "$src" fetch -q --depth 1 https://github.com/Astyyyyy/fsr4-vk "$FSR4_VK_COMMIT"
+          git -C "$src" checkout -q FETCH_HEAD
+          git -C "$src" submodule update --init --recursive --depth 1
+          dll="$RUNNER_TEMP/amd_fidelityfx_upscaler_dx12.dll"
+          curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o "$dll" \
+            "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/$AMD_SDK_COMMIT/Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_dx12.dll"
+          echo "$AMD_DLL_SHA256  $dll" | sha256sum -c -
+          python3 -m venv "$RUNNER_TEMP/fsr4-venv"
+          "$RUNNER_TEMP/fsr4-venv/bin/pip" install -q zstandard
+          cd "$src"
+          "$RUNNER_TEMP/fsr4-venv/bin/python" tools/setup.py --dll "$dll"
+          PATH="$RUNNER_TEMP/fsr4-venv/bin:$PATH" FSR4_BUILD_JOBS=$(nproc) bash tools/build/linux.sh
+          out="$RUNNER_TEMP/fsr4-out"; mkdir -p "$out/licenses"
+          cp build/linux/amd_fidelityfx_upscaler_vk.so "$out/"
+          strip "$out/amd_fidelityfx_upscaler_vk.so"
+          cp LICENSE "$out/licenses/fsr4-vk-GPL-3.0.txt"; cp THIRD_PARTY_NOTICES.md "$out/licenses/"
+          cp LICENSES/* "$out/licenses/"
+          nm -D --defined-only "$out/amd_fidelityfx_upscaler_vk.so" | grep -E ' ffx(CreateContext|Dispatch|Query|DestroyContext)$'
+          ls -la "$out"
+
       - name: Package AppImage
         run: |
           set -euo pipefail
@@ -339,6 +376,16 @@ jobs:
             cp "$tools/mold-2.40.4-x86_64-linux/share/doc/mold/LICENSE" AppDir/usr/share/doc/mold/LICENSE
             dlss_tools=(--executable "$tools/mold-2.40.4-x86_64-linux/bin/mold")
             echo "DLSS bridge object and mold linker added"
+          fi
+          # AMD FSR 4 (fsr4-vk), when the step above built it: loaded from usr/lib/fsr4 by fsr4-linux.patch.
+          if [ -f "$RUNNER_TEMP/fsr4-out/amd_fidelityfx_upscaler_vk.so" ]; then
+            install -Dm755 "$RUNNER_TEMP/fsr4-out/amd_fidelityfx_upscaler_vk.so" AppDir/usr/lib/fsr4/amd_fidelityfx_upscaler_vk.so
+            mkdir -p AppDir/usr/share/doc/fsr4-vk
+            cp "$RUNNER_TEMP/fsr4-out/licenses/"* AppDir/usr/share/doc/fsr4-vk/
+            echo "FSR4_LINUX=1" >> "$GITHUB_ENV"
+            echo "AMD FSR 4 (fsr4-vk) added"
+          elif [ -f _linux-patches/.github/linux-patches/fsr4-linux.patch ]; then
+            echo "::warning::fsr4-vk did not build; this AppImage has no FSR 4 (FSR 3.1 stays available)"
           fi
           # The shader preparation recipes ("Preparing shaders": OoT's ~120k pipelines) ship only in
           # Fritchii's Windows release; the program reads them from recipes/ next to itself. They
