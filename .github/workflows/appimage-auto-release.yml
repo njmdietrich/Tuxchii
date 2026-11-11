@@ -2,7 +2,8 @@
 # release in this repository.
 #
 # Put this file at .github/workflows/appimage-auto-release.yml on your fork's default branch.
-# - Every 2 hours it checks Frizti/Fritchii's newest "fritchii-*" releases (BACKFILL of them).
+# - Every 2 hours it checks Frizti/Fritchii's newest "fritchii-*" releases (BACKFILL of them);
+#   x.y.z patch releases are skipped unless their tag is entered by hand.
 # - Each one this repo has no "appimage-<tag>" release for yet is built and published.
 # - Run it by hand from the Actions tab to build now, or to rebuild a specific tag.
 # - TEST BUILDS: run it from any other branch (Run workflow > "Use workflow from: testing").
@@ -54,6 +55,9 @@ jobs:
           mapfile -t releases < <(gh api "repos/$UPSTREAM/releases?per_page=50" --jq \
             "[.[] | select(.draft | not) | select(.tag_name | startswith(\"$TAG_PREFIX\"))]
              | sort_by(.published_at) | reverse | .[].tag_name")
+          # Only x and x.y versions build on their own; x.y.z patch releases are skipped (the user's
+          # choice, 2026-11-10). Build one by entering its tag in "Run workflow".
+          mapfile -t releases < <(printf '%s\n' "${releases[@]}" | grep -E "^${TAG_PREFIX}v[0-9]+(\.[0-9]+)?$" || true)
           newest="${releases[0]:-}"
           echo "newest=$newest" >> "$GITHUB_OUTPUT"
           if [ -n "${INPUT_TAG:-}" ]; then
