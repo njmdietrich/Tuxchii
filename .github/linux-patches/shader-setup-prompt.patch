@@ -35,7 +35,7 @@ index a5e2d11..fb3375c 100644
      if (FritchiiUi::Enabled()) {
          perf_overlay = new FritchiiUi::PerfOverlay(
              this, [this] { ui->action_Show_Performance_Overlay->setChecked(false); });
-@@ -4632,6 +4644,84 @@ void MainWindow::OnGameListDeleteShaderWarm(u64 program_id) {
+@@ -4632,6 +4644,85 @@ void MainWindow::OnGameListDeleteShaderWarm(u64 program_id) {
      }
  }
  
@@ -59,10 +59,11 @@ index a5e2d11..fb3375c 100644
 +    box.setWindowTitle(tr("Prepare Shaders"));
 +    box.setText(tr("Prepare this game's shaders before playing?"));
 +    box.setInformativeText(
-+        tr("All of the game's shaders are built once, so it plays without shader stutter. It "
-+           "can take 20 to 40 minutes or more. The game starts paused while they build, and you "
-+           "are told when it is ready to play.\n\nYou can also do it later: right-click the game "
-+           "and choose Prepare shaders, then use Emulation > Prepare Shaders Now in the game."));
++        tr("It's recommended to pre-build all of the game's shaders before playing: the game "
++           "runs much smoother. This can take 20 minutes or more depending on your system. The "
++           "game starts paused while they build, and you are told when it is ready to play.\n\n"
++           "You can also do it later: right-click the game and choose Prepare shaders, then use "
++           "Emulation > Prepare Shaders Now in the game."));
 +    auto* prepare = box.addButton(tr("Prepare Shaders"), QMessageBox::AcceptRole);
 +    box.addButton(tr("Play Now"), QMessageBox::RejectRole);
 +    box.setDefaultButton(prepare);
