@@ -4,7 +4,8 @@
 # Put this file at .github/workflows/appimage-auto-release.yml on your fork's default branch.
 # - Every 2 hours it checks Frizti/Fritchii's newest "fritchii-*" releases (BACKFILL of them);
 #   x.y.z patch releases are skipped unless their tag is entered by hand.
-# - Each one this repo has no "appimage-<tag>" release for yet is built and published.
+# - Each one this repo has no release for yet is built and published as "tuxchii-v<version>"
+#   (releases up to v5.8.4 were tagged "appimage-<tag>").
 # - Run it by hand from the Actions tab to build now, or to rebuild a specific tag.
 # - TEST BUILDS: run it from any other branch (Run workflow > "Use workflow from: testing").
 #   That builds the given tag (blank = newest) with that branch's patches and uploads the
@@ -80,8 +81,9 @@ jobs:
           missing=()
           for tag in "${candidates[@]}"; do
             if [ "$TEST_BUILD" != "true" ] && [ "${FORCE:-false}" != "true" ] &&
-               gh release view "appimage-$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              echo "appimage-$tag already published"
+               { gh release view "tuxchii-${tag#$TAG_PREFIX}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+                 gh release view "appimage-$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; }; then
+              echo "$tag already published"
             else
               echo "Will build $tag"; missing+=("$tag")
             fi
@@ -410,7 +412,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          rel="appimage-$TAG"
+          # Releases are tagged "tuxchii-v<version>"; a rebuild of an older release keeps its
+          # original "appimage-<tag>" tag so its links stay valid.
+          rel="tuxchii-${TAG#$TAG_PREFIX}"
+          if ! gh release view "$rel" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 &&
+             gh release view "appimage-$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            rel="appimage-$TAG"
+          fi
           sha256sum "$APPIMAGE" > "$APPIMAGE.sha256"
           export VER="${TAG#$TAG_PREFIX}" COMMIT="$(git rev-parse --short HEAD)"
           export SHA256="$(cut -d' ' -f1 "$APPIMAGE.sha256")" CLASSIC="${CLASSIC_UI_DEFAULT:-0}"
