@@ -107,7 +107,11 @@ void NVSDK_NGX_Parameter_SetVoidPointer(NgxParameter* parameters, const char* na
 NgxResult NVSDK_NGX_Parameter_GetI(NgxParameter* parameters, const char* name, int* value);
 NgxResult NVSDK_NGX_Parameter_GetUI(NgxParameter* parameters, const char* name,
                                     unsigned int* value);
+NgxResult NVSDK_NGX_Parameter_GetVoidPointer(NgxParameter* parameters, const char* name,
+                                             void** value);
 }
+
+using NgxOptimalSettingsCallback = NgxResult (*)(NgxParameter* parameters);
 
 // Fritchii's NGX project ID (the same one its Windows build gives NVIDIA Streamline).
 constexpr const char* PROJECT_ID = "8d3e2f9a-6b41-4c7e-9a52-1f0c3b7d5e64";
@@ -130,6 +134,7 @@ struct State {
     VkDevice device{};
     bool started{};
     NgxParameter* parameters{};
+    NgxParameter* capabilities{}; ///< Kept for DLSS's optimal settings callback
     NgxHandle* handle{};
     CreateSettings created{};
     FdbLogFn log{};
@@ -305,7 +310,7 @@ FDB_EXPORT int fdb_init(VkInstance instance, VkPhysicalDevice physical_device, V
         fdb_shutdown();
         return 0;
     }
-    NVSDK_NGX_VULKAN_DestroyParameters(capabilities);
+    state.capabilities = capabilities;
 
     result = NVSDK_NGX_VULKAN_AllocateParameters(&state.parameters);
     if (NgxFailed(result) || !state.parameters) {
@@ -314,6 +319,49 @@ FDB_EXPORT int fdb_init(VkInstance instance, VkPhysicalDevice physical_device, V
         return 0;
     }
     Log(0, "NVIDIA DLSS is available (NGX)");
+    return 1;
+}
+
+FDB_EXPORT int fdb_render_size_range(uint32_t output_width, uint32_t output_height,
+                                     int32_t quality, uint32_t* min_width, uint32_t* min_height,
+                                     uint32_t* max_width, uint32_t* max_height) {
+    State& state = GetState();
+    if (!state.started || !state.capabilities) {
+        Log(2, "DLSS is not started");
+        return 0;
+    }
+    NgxParameter* const p = state.capabilities;
+    void* callback = nullptr;
+    NVSDK_NGX_Parameter_GetVoidPointer(p, "DLSSOptimalSettingsCallback", &callback);
+    if (!callback) {
+        Log(1, "This DLSS model has no optimal settings query");
+        return 0;
+    }
+    NVSDK_NGX_Parameter_SetUI(p, "Width", output_width);
+    NVSDK_NGX_Parameter_SetUI(p, "Height", output_height);
+    NVSDK_NGX_Parameter_SetI(p, "PerfQualityValue", quality);
+    NVSDK_NGX_Parameter_SetI(p, "RTXValue", 0);
+    const NgxResult result = reinterpret_cast<NgxOptimalSettingsCallback>(callback)(p);
+    if (NgxFailed(result)) {
+        return 0;
+    }
+    unsigned int optimal_width = 0;
+    unsigned int optimal_height = 0;
+    NVSDK_NGX_Parameter_GetUI(p, "OutWidth", &optimal_width);
+    NVSDK_NGX_Parameter_GetUI(p, "OutHeight", &optimal_height);
+    if (optimal_width == 0 || optimal_height == 0) {
+        return 0; // The mode isn't offered for this output size
+    }
+    // Older DLSS models report only the optimal size.
+    unsigned int values[4] = {optimal_width, optimal_height, optimal_width, optimal_height};
+    NVSDK_NGX_Parameter_GetUI(p, "DLSS.Get.Dynamic.Min.Render.Width", &values[0]);
+    NVSDK_NGX_Parameter_GetUI(p, "DLSS.Get.Dynamic.Min.Render.Height", &values[1]);
+    NVSDK_NGX_Parameter_GetUI(p, "DLSS.Get.Dynamic.Max.Render.Width", &values[2]);
+    NVSDK_NGX_Parameter_GetUI(p, "DLSS.Get.Dynamic.Max.Render.Height", &values[3]);
+    *min_width = values[0];
+    *min_height = values[1];
+    *max_width = values[2];
+    *max_height = values[3];
     return 1;
 }
 
@@ -411,6 +459,10 @@ FDB_EXPORT void fdb_shutdown(void) {
     if (state.parameters) {
         NVSDK_NGX_VULKAN_DestroyParameters(state.parameters);
         state.parameters = nullptr;
+    }
+    if (state.capabilities) {
+        NVSDK_NGX_VULKAN_DestroyParameters(state.capabilities);
+        state.capabilities = nullptr;
     }
     NVSDK_NGX_VULKAN_Shutdown1(state.device);
     state.started = false;
