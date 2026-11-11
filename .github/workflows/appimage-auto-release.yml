@@ -403,7 +403,7 @@ jobs:
 
           ## Classic interface by default
 
-          Fritchii's own dark interface (Graphite theme, Inter font, home screen) ignores your desktop theme, font size and scaling, which causes accessibility problems on Linux, so **this build opens in the classic interface**, which follows your system settings like any other Qt app.
+          **This build opens in the classic interface**, mainly so it works well with SteamOS / Steam Big Picture mode. It also follows your desktop theme, font size and scaling like any other Qt app, which Fritchii's own dark interface (Graphite theme, Inter font, home screen) doesn't.
 
           To use Fritchii's interface instead:
           - **Settings → UI → General → "Use the Fritchii interface (restart required)"**, then restart Fritchii. Untick it the same way to go back.
