@@ -339,6 +339,10 @@ jobs:
             : > "$RUNNER_TEMP/upstream.md"
           # Release notes: the same layout for every version. {{...}} are filled in below.
           cat > "$RUNNER_TEMP/notes.md" <<'EOF'
+          ## Linux changes in this build
+          Fritchii is only tested on Windows, so these changes are made for Linux before compiling (all visible in the public build log and in [linux-patches]({{PATCHES}})):
+          {{LINUX_BULLETS}}- **Compile fixes** for Windows-only code paths (X11 `Status` macro clash, Linux `GetExeDirectory()`, a Windows-only log variable), applied only where needed
+
           Linux x86_64 AppImage of [Fritchii {{VER}}](https://github.com/{{UPSTREAM}}/releases/tag/{{TAG}}), built automatically on GitHub from upstream commit `{{COMMIT}}`.
 
           > ⚠️ Unofficial build. Fritchii only publishes Windows builds. Report Linux-specific problems here, not upstream.
@@ -366,10 +370,6 @@ jobs:
           ```
 
           {{CHANGELOG}}
-          ## Linux changes in this build
-          Fritchii is only tested on Windows, so a few small changes are applied before compiling (all visible in the public build log):
-          {{CLASSIC_BULLET}}- **Compile fixes** for Windows-only code paths (X11 `Status` macro clash, Linux `GetExeDirectory()`, a Windows-only log variable), applied only where needed
-
           ## Notes
           - Games, keys and firmware are **not** included. Only use files you've legally dumped yourself.
           - Thanks to Frizti, zortos293 and the Lichii/Eden/yuzu contributors.
@@ -390,7 +390,28 @@ jobs:
           import os, sys
           notes, classic, repo = open(sys.argv[1]).read(), open(sys.argv[2]).read(), sys.argv[3]
           on = os.environ["CLASSIC"] == "1"
-          link = f"https://github.com/{repo}/blob/{os.environ.get('GITHUB_REF_NAME', 'nx2')}/.github/linux-patches/classic-ui-setting.patch"
+          patches = f"https://github.com/{repo}/tree/{os.environ.get('GITHUB_REF_NAME', 'nx2')}/.github/linux-patches"
+          link = lambda name: f"https://github.com/{repo}/blob/{os.environ.get('GITHUB_REF_NAME', 'nx2')}/.github/linux-patches/{name}"
+          applied = os.environ.get("EXTRA_PATCHES", "").split(", ")
+          # One line per Linux patch this build applied, newest features first.
+          bullets = ""
+          if "zz-nvidia-dlss-linux.patch" in applied:
+              bullets += (f"- **NVIDIA DLSS on Linux** (RTX cards): **Settings → Graphics → Install DLSS...** downloads NVIDIA's DLSS files (about 60 MB) "
+                          f"from NVIDIA onto your PC, then the DLSS option and DLSS quality modes work as on Windows. NVIDIA's license doesn't allow "
+                          f"shipping those files here, so they are never part of the AppImage ([patch]({link('zz-nvidia-dlss-linux.patch')}), "
+                          f"[bridge]({link('dlss-bridge/README.md')}))\n")
+          if "shader-setup-prompt.patch" in applied:
+              bullets += (f"- **Shader setup on a game's first launch:** Fritchii offers to pre-build all of the game's shaders before you play (much smoother, "
+                          f"about 20 minutes or more). The game starts paused while they build and tells you when it's ready "
+                          f"([patch]({link('shader-setup-prompt.patch')}))\n")
+          if "shader-cache-import.patch" in applied:
+              bullets += (f"- **Your shader cache comes along:** v5.8 moved Fritchii's folders from `eden` to `fritchii` and copies settings, saves and keys, "
+                          f"but not caches. This build also copies each game's shader cache from `~/.cache/eden` (or Lichii's) to `~/.cache/fritchii` once, "
+                          f"so games don't start stuttering again ([patch]({link('shader-cache-import.patch')}))\n")
+          if "steam-deck-test.patch" in applied:
+              bullets += (f"- **Prepare Shaders on AMD and Intel (Steam Deck too):** upstream only prepares shaders on NVIDIA; Mesa drivers (RADV, ANV, NVK) "
+                          f"now get them as well, the classic interface shows the \"Preparing shaders\" screen, and a Steam Deck switches to handheld mode once "
+                          f"(docked 1080p is too heavy for it) ([patch]({link('steam-deck-test.patch')}))\n")
           # Frizti's changelog: everything after the first "---" line (above it are the Windows
           # download instructions, which don't apply to the AppImage).
           upstream = open(os.path.join(os.environ["RUNNER_TEMP"], "upstream.md")).read().replace("\r\n", "\n")
@@ -412,7 +433,8 @@ jobs:
               "VER": os.environ["VER"], "TAG": os.environ["TAG"], "UPSTREAM": os.environ["UPSTREAM"],
               "COMMIT": os.environ["COMMIT"], "SHA256": os.environ["SHA256"], "APPIMAGE": os.environ["APPIMAGE"],
               "CLASSIC_SECTION": classic if on else "",
-              "CLASSIC_BULLET": f"- **Classic interface by default**, with the settings checkbox above ([patch]({link}))\n" if on else "",
+              "PATCHES": patches,
+              "LINUX_BULLETS": bullets + (f"- **Classic interface by default**, with a settings checkbox to switch (see below) ([patch]({link('classic-ui-setting.patch')}))\n" if on else ""),
           }
           for k, v in values.items():
               notes = notes.replace("{{" + k + "}}", v)
