@@ -16,7 +16,8 @@ import sys
 NEW = "Tuxchii"
 
 # Proper names of the app, as whole words, in string literals.
-NAMES = re.compile(r"\b(Fritchii|Lichii)\b")
+# (also right after an escape such as "\nFritchii")
+NAMES = re.compile(r"(?:(?<=\\[nt])|(?<![A-Za-z0-9_]))(?:Fritchii|Lichii)\b")
 
 # Text that names another project, an older build or a folder on disk, not this app.
 PROTECT = [
@@ -24,7 +25,7 @@ PROTECT = [
     r"Earlier Lichii builds", r"earlier Fritchii", r"Fritchii or Eden folder",
     r"Fritchii-v", r"Fritchii #\d", r"Lichii#\d", r"Lichii contributor",
     # The community Discord and the emulators a profile can be imported from are other projects.
-    r"Fritchii &?Discord", r'QT_TR_NOOP\("Lichii"\), LichiiDir',
+    r"Fritchii &?Discord",
 ]
 
 # Files whose strings are identifiers or protocol data, never shown as the app's name.
@@ -38,7 +39,9 @@ SKIP_DIRS = ("src/tests/", "src/dynarmic/", "src/android/", "src/web_service/")
 SKIP_LINE = re.compile(
     r"g_build_name|LOG_[A-Z]+\(|getenv|qEnvironmentVariable|setObjectName|setProperty|"
     r"property\(|QFile|\":/|QIcon::fromTheme|setDesktopFileName|setOrganizationName|"
-    r"setApplicationName|objectName|HiddenReleaseMarker|RepoNames|ReleaseRepo|User-Agent")
+    r"setApplicationName|objectName|HiddenReleaseMarker|RepoNames|ReleaseRepo|User-Agent|"
+    # The other emulators' folders a profile or saves can be imported from keep their names.
+    r"LichiiDir|LegacyEdenDir")
 
 # Places where upstream still calls the app "Eden" (the emulator it is built on) as its own name.
 EDEN_SELF = [
