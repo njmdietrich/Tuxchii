@@ -1,8 +1,8 @@
 diff --git a/src/yuzu/main_window.cpp b/src/yuzu/main_window.cpp
-index 28497a9772..ec51c5c87c 100644
+index a5e2d11..fb3375c 100644
 --- a/src/yuzu/main_window.cpp
 +++ b/src/yuzu/main_window.cpp
-@@ -2393,6 +2393,9 @@ bool MainWindow::OnShutdownBegin() {
+@@ -2396,6 +2396,9 @@ bool MainWindow::OnShutdownBegin() {
          return false;
      }
  
@@ -12,7 +12,7 @@ index 28497a9772..ec51c5c87c 100644
      if (shader_warm_run_dialog) {
          shader_warm_run_dialog->close();
      }
-@@ -2658,6 +2661,9 @@ void MainWindow::UpdateRecentFiles() {
+@@ -2662,6 +2665,9 @@ void MainWindow::UpdateRecentFiles() {
  }
  
  void MainWindow::OnGameListLoadFile(QString game_path, u64 program_id) {
@@ -22,7 +22,7 @@ index 28497a9772..ec51c5c87c 100644
      auto params = ApplicationAppletParameters();
      params.program_id = program_id;
  
-@@ -3487,6 +3493,12 @@ bool MainWindow::ConfirmShutdownGame() {
+@@ -3491,6 +3497,12 @@ bool MainWindow::ConfirmShutdownGame() {
  void MainWindow::OnLoadComplete() {
      loading_screen->OnLoadComplete();
  
@@ -35,7 +35,7 @@ index 28497a9772..ec51c5c87c 100644
      if (FritchiiUi::Enabled()) {
          perf_overlay = new FritchiiUi::PerfOverlay(
              this, [this] { ui->action_Show_Performance_Overlay->setChecked(false); });
-@@ -4560,6 +4572,84 @@ void MainWindow::OnGameListDeleteShaderWarm(u64 program_id) {
+@@ -4632,6 +4644,84 @@ void MainWindow::OnGameListDeleteShaderWarm(u64 program_id) {
      }
  }
  
@@ -120,7 +120,7 @@ index 28497a9772..ec51c5c87c 100644
  void MainWindow::OnPrepareShadersNow() {
      if (!emulation_running || !QtCommon::system->IsPoweredOn()) {
          return;
-@@ -4599,20 +4689,31 @@ void MainWindow::OnPrepareShadersNow() {
+@@ -4671,20 +4761,31 @@ void MainWindow::OnPrepareShadersNow() {
      dialog->setLabel(label);
      shader_warm_run_dialog = dialog;
  
@@ -157,7 +157,7 @@ index 28497a9772..ec51c5c87c 100644
          if (!emulation_running || !QtCommon::system->IsPoweredOn() ||
              QtCommon::system->IsShuttingDown()) {
              dialog->close();
-@@ -4625,8 +4726,17 @@ void MainWindow::OnPrepareShadersNow() {
+@@ -4697,8 +4798,17 @@ void MainWindow::OnPrepareShadersNow() {
              shader_notify.SetWarmRequested(false);
              dialog->setRange(0, 1);
              dialog->setValue(1);
@@ -178,10 +178,10 @@ index 28497a9772..ec51c5c87c 100644
              const auto warm = shader_notify.GetWarmProgress();
              const auto done = static_cast<qulonglong>(warm.done);
 diff --git a/src/yuzu/main_window.h b/src/yuzu/main_window.h
-index 72c8300067..87ff36be55 100644
+index 0b17601..fed64e3 100644
 --- a/src/yuzu/main_window.h
 +++ b/src/yuzu/main_window.h
-@@ -366,6 +366,10 @@ private slots:
+@@ -372,6 +372,10 @@ private slots:
      void OnGameListPrepareShaderWarm(u64 program_id, const std::string& game_path);
      void OnGameListDeleteShaderWarm(u64 program_id);
      void OnPrepareShadersNow();
@@ -192,12 +192,12 @@ index 72c8300067..87ff36be55 100644
      void OnGameListExtractNup(const std::string& game_path);
      void OnGameListEditNupMetadata(const std::string& game_path);
      void OnGameListCopyTID(u64 program_id);
-@@ -633,6 +637,8 @@ private:
+@@ -650,6 +654,8 @@ private:
      QPointer<ShaderWarmDialog> shader_warm_dialog;
      QAction* action_prepare_shaders_now = nullptr;
      QPointer<QProgressDialog> shader_warm_run_dialog;
 +    bool shader_setup_boot{}; ///< The game was started by OfferShaderSetup
 +    bool shader_setup_run{};  ///< Prepare Shaders Now was started by it
+     NxTools* nx_tools = nullptr;
+     bool nx_metadata_write_in_progress = false;
      std::string nup_source_path;
- 
-     // Last game booted, used for multi-process apps
