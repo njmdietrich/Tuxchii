@@ -1,0 +1,674 @@
+diff --git a/src/yuzu/CMakeLists.txt b/src/yuzu/CMakeLists.txt
+index 3528b26c41..a24869e221 100644
+--- a/src/yuzu/CMakeLists.txt
++++ b/src/yuzu/CMakeLists.txt
+@@ -261,6 +261,7 @@ add_executable(yuzu
+ 
+     render/performance_overlay.h render/performance_overlay.cpp render/performance_overlay.ui
+     updater/update_dialog.h updater/update_dialog.cpp updater/update_dialog.ui
++    tuxchii_updater.h tuxchii_updater.cpp
+     game/common.h
+     game/carousel.h game/carousel.cpp
+ )
+diff --git a/src/yuzu/main_window.cpp b/src/yuzu/main_window.cpp
+index 571509f89d..085d961433 100644
+--- a/src/yuzu/main_window.cpp
++++ b/src/yuzu/main_window.cpp
+@@ -138,6 +138,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
+ 
+ #ifdef ENABLE_UPDATE_CHECKER
+ #include "frontend_common/update_checker.h"
++#include "yuzu/tuxchii_updater.h"
+ #endif
+ 
+ // Common //
+@@ -5275,6 +5276,12 @@ void MainWindow::OnCaptureScreenshot() {
+ 
+ #ifdef ENABLE_UPDATE_CHECKER
+ void MainWindow::StartUpdateCheck(bool manual) {
++#ifdef __linux__
++    // Linux build patch (Tuxchii): the AppImage updates from Tuxchii's own releases; Fritchii's
++    // updater only installs its Windows zip.
++    Tuxchii::Updater::Check(this, manual, [this] { return !emulation_running && !boot_in_progress; });
++    return;
++#endif
+     if (update_watcher.isRunning()) {
+         update_check_manual |= manual;
+         return;
+diff --git a/src/yuzu/tuxchii_updater.cpp b/src/yuzu/tuxchii_updater.cpp
+new file mode 100644
+index 0000000000..6de0424bb6
+--- /dev/null
++++ b/src/yuzu/tuxchii_updater.cpp
+@@ -0,0 +1,605 @@
++// SPDX-FileCopyrightText: Copyright 2026 Tuxchii contributors
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Linux build patch (Tuxchii): updates the AppImage from Tuxchii's own GitHub releases.
++//
++// The newest release ("Latest") is compared with this build: a higher version, or the same version
++// built again (releases carry "<!-- tuxchii-build: N -->", the build's workflow run number), is an
++// update. Installing downloads the new AppImage next to the running one, checks it against the
++// release's .sha256 file, keeps the running file as "<name>.previous" (for Roll Back) and puts the
++// new one at the same path, so launchers and game shortcuts keep working. Linux allows replacing
++// the file while it runs; the new version starts once this one has closed.
++
++#include "yuzu/tuxchii_updater.h"
++
++#ifdef __linux__
++
++#include <filesystem>
++#include <fstream>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include <unistd.h>
++
++#include <QApplication>
++#include <QCryptographicHash>
++#include <QDateTime>
++#include <QDesktopServices>
++#include <QDir>
++#include <QFutureWatcher>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QMessageBox>
++#include <QPointer>
++#include <QProcess>
++#include <QProcessEnvironment>
++#include <QProgressDialog>
++#include <QPushButton>
++#include <QRegularExpression>
++#include <QTimer>
++#include <QUrl>
++#include <QtConcurrent/QtConcurrentRun>
++
++#include <fmt/format.h>
++
++#include "common/fs/path_util.h"
++#include "common/httplib.h"
++#include "common/logging.h"
++#include "common/scm_rev.h"
++#include "frontend_common/update_installer.h"
++#include "qt_common/config/uisettings.h"
++
++// Written by the build (.github/workflows/appimage-auto-release.yml).
++#if __has_include("yuzu/tuxchii_build.h")
++#include "yuzu/tuxchii_build.h"
++#endif
++#ifndef TUXCHII_REPO
++#define TUXCHII_REPO "xTopher1049/Tuxchii"
++#endif
++#ifndef TUXCHII_BUILD_NUMBER
++#define TUXCHII_BUILD_NUMBER 0 // test and local builds: any release of this version is newer
++#endif
++
++namespace Tuxchii::Updater {
++namespace {
++
++namespace fs = std::filesystem;
++
++constexpr char ApiHost[] = "https://api.github.com";
++constexpr char UserAgent[] = "Tuxchii-updater";
++// Read by the new process (yuzu/updater/update_dialog.cpp, PrepareLaunch): it waits for this one
++// to exit, then shows the note once.
++constexpr char RestartNoteVariable[] = "LICHII_UPDATE_NOTE";
++
++struct Release {
++    QString tag;
++    QString version;     ///< "v5.9"
++    unsigned build{};    ///< workflow run number; 0 when the release doesn't say
++    QString page;        ///< the release's web page
++    QString appimage;    ///< asset name, "Tuxchii-v5.9-x86_64.AppImage"
++    QString appimage_url;
++    QString sha256_url;
++    qint64 size{};
++};
++
++struct CheckResult {
++    std::optional<Release> update;
++    QString error;
++};
++
++QString Tr(const char* text) {
++    return QCoreApplication::translate("TuxchiiUpdater", text);
++}
++
++/// The system's CA certificates, so HTTPS works whichever distribution the AppImage runs on.
++std::string CaBundle() {
++    std::error_code ec;
++    for (const char* path :
++         {"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
++          "/etc/ssl/ca-bundle.pem", "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
++          "/etc/ssl/cert.pem"}) {
++        if (fs::is_regular_file(path, ec)) {
++            return path;
++        }
++    }
++    return {};
++}
++
++/// GET with redirects followed by hand (GitHub sends downloads to another host, and each client
++/// must get the CA bundle). `receiver` takes the body; returns an error text or "".
++std::string Get(std::string url, const httplib::ContentReceiver& receiver, int* status_out = nullptr) {
++    const std::string ca = CaBundle();
++    for (int hop = 0; hop < 6; ++hop) {
++        const auto scheme_end = url.find("://");
++        const auto path_start =
++            scheme_end == std::string::npos ? std::string::npos : url.find('/', scheme_end + 3);
++        if (path_start == std::string::npos) {
++            return "bad address " + url;
++        }
++        httplib::Client client(url.substr(0, path_start));
++        client.set_connection_timeout(30);
++        client.set_read_timeout(60);
++        client.set_follow_location(false);
++        if (!ca.empty()) {
++            client.set_ca_cert_path(ca);
++        }
++        const httplib::Headers headers{{"User-Agent", UserAgent},
++                                       {"Accept", "application/vnd.github+json, */*"}};
++        int status = 0;
++        std::string location;
++        const auto result = client.Get(
++            url.substr(path_start), headers,
++            [&](const httplib::Response& response) {
++                status = response.status;
++                if (status >= 300 && status < 400) {
++                    location = response.get_header_value("Location");
++                    return false;
++                }
++                return status == 200;
++            },
++            receiver);
++        if (status >= 300 && status < 400 && !location.empty()) {
++            url = location.starts_with("/") ? url.substr(0, path_start) + location : location;
++            continue;
++        }
++        if (status_out) {
++            *status_out = status;
++        }
++        if (status != 0 && status != 200) {
++            return fmt::format("HTTP {}", status);
++        }
++        if (!result) {
++            return httplib::to_string(result.error());
++        }
++        return {};
++    }
++    return "too many redirects";
++}
++
++/// "v5.8.1" -> {5, 8, 1}
++std::vector<unsigned> ParseVersion(const QString& text) {
++    std::vector<unsigned> parts;
++    const QRegularExpressionMatch match =
++        QRegularExpression(QStringLiteral("v?(\\d+(?:\\.\\d+)*)$")).match(text);
++    if (!match.hasMatch()) {
++        return parts;
++    }
++    for (const QString& part : match.captured(1).split(QLatin1Char('.'))) {
++        parts.push_back(part.toUInt());
++    }
++    return parts;
++}
++
++int CompareVersions(std::vector<unsigned> a, std::vector<unsigned> b) {
++    const auto size = std::max(a.size(), b.size());
++    a.resize(size);
++    b.resize(size);
++    return a < b ? -1 : (a > b ? 1 : 0);
++}
++
++QString RunningVersion() {
++    return QString::fromUtf8(Common::g_build_version);
++}
++
++/// Asks GitHub for the newest release (runs off the GUI thread).
++CheckResult FetchLatest() {
++    std::string body;
++    int status = 0;
++    const std::string error = Get(
++        fmt::format("{}/repos/{}/releases/latest", ApiHost, TUXCHII_REPO),
++        [&](const char* data, size_t length) {
++            body.append(data, length);
++            return body.size() < 4 * 1024 * 1024;
++        },
++        &status);
++    if (status == 404) {
++        return {}; // no release yet
++    }
++    if (status == 403 || status == 429) {
++        return {.error = Tr("GitHub's limit for update checks was reached. Try again in an hour.")};
++    }
++    if (!error.empty()) {
++        return {.error = QString::fromStdString(error)};
++    }
++    const QJsonObject json = QJsonDocument::fromJson(QByteArray::fromStdString(body)).object();
++    Release release;
++    release.tag = json.value(QStringLiteral("tag_name")).toString();
++    release.page = json.value(QStringLiteral("html_url")).toString();
++    const QRegularExpressionMatch tag_version =
++        QRegularExpression(QStringLiteral("(v\\d+(?:\\.\\d+)*)$")).match(release.tag);
++    release.version = tag_version.captured(1);
++    const QRegularExpressionMatch build =
++        QRegularExpression(QStringLiteral("<!--\\s*tuxchii-build:\\s*(\\d+)\\s*-->"))
++            .match(json.value(QStringLiteral("body")).toString());
++    release.build = build.hasMatch() ? build.captured(1).toUInt() : 0;
++    const QRegularExpression appimage_name(
++        QStringLiteral("^Tuxchii-v\\d+(?:\\.\\d+)*-x86_64\\.AppImage$"));
++    const QJsonArray assets = json.value(QStringLiteral("assets")).toArray();
++    for (const QJsonValue& value : assets) {
++        const QJsonObject asset = value.toObject();
++        const QString name = asset.value(QStringLiteral("name")).toString();
++        if (appimage_name.match(name).hasMatch()) {
++            release.appimage = name;
++            release.appimage_url = asset.value(QStringLiteral("browser_download_url")).toString();
++            release.size = asset.value(QStringLiteral("size")).toInteger();
++        }
++    }
++    for (const QJsonValue& value : assets) {
++        const QJsonObject asset = value.toObject();
++        if (!release.appimage.isEmpty() &&
++            asset.value(QStringLiteral("name")).toString() == release.appimage + QStringLiteral(".sha256")) {
++            release.sha256_url = asset.value(QStringLiteral("browser_download_url")).toString();
++        }
++    }
++    if (release.version.isEmpty() || release.appimage_url.isEmpty() || release.sha256_url.isEmpty()) {
++        return {}; // not a Tuxchii AppImage release
++    }
++    const int order = CompareVersions(ParseVersion(release.version), ParseVersion(RunningVersion()));
++    if (order > 0 || (order == 0 && release.build > TUXCHII_BUILD_NUMBER)) {
++        LOG_INFO(Frontend, "Tuxchii update available: {} (build {})", release.tag.toStdString(),
++                 release.build);
++        return {.update = std::move(release)};
++    }
++    return {};
++}
++
++QString SkipKey(const Release& release) {
++    return QStringLiteral("%1#%2").arg(release.tag).arg(release.build);
++}
++
++QString Describe(const Release& release) {
++    QString text = QStringLiteral("Tuxchii %1").arg(release.version);
++    if (CompareVersions(ParseVersion(release.version), ParseVersion(RunningVersion())) == 0) {
++        text += QStringLiteral(" (build %1)").arg(release.build);
++    }
++    return text;
++}
++
++/// The running AppImage, when this is one.
++fs::path AppImagePath() {
++    const QString path = qEnvironmentVariable("APPIMAGE");
++    std::error_code ec;
++    if (path.isEmpty() || !fs::is_regular_file(path.toStdString(), ec)) {
++        return {};
++    }
++    return fs::path{path.toStdString()};
++}
++
++bool CanReplace(const fs::path& appimage) {
++    return !appimage.empty() && access(appimage.parent_path().c_str(), W_OK | X_OK) == 0;
++}
++
++fs::path BackupPath(const fs::path& appimage) {
++    return fs::path{appimage.string() + ".previous"};
++}
++
++/// Starts the AppImage at `appimage` once this process has exited, then closes this window. The
++/// AppImage runtime's variables, which point into this version's mount, are left out.
++void Restart(QWidget* window, const fs::path& appimage, const QString& note) {
++    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
++    const QString appdir = environment.value(QStringLiteral("APPDIR"));
++    for (const char* name : {"APPDIR", "APPIMAGE", "ARGV0", "OWD"}) {
++        environment.remove(QString::fromLatin1(name));
++    }
++    if (!appdir.isEmpty()) {
++        for (const QString& key : environment.keys()) {
++            const QString value = environment.value(key);
++            if (!value.contains(appdir)) {
++                continue;
++            }
++            QStringList kept;
++            for (const QString& entry : value.split(QLatin1Char(':'))) {
++                if (!entry.startsWith(appdir)) {
++                    kept.push_back(entry);
++                }
++            }
++            if (kept.isEmpty() || kept.join(QLatin1Char(':')).isEmpty()) {
++                environment.remove(key);
++            } else {
++                environment.insert(key, kept.join(QLatin1Char(':')));
++            }
++        }
++    }
++    environment.insert(QString::fromLatin1(UpdateInstaller::RestartWaitVariable),
++                       QString::number(QCoreApplication::applicationPid()));
++    environment.insert(QString::fromLatin1(RestartNoteVariable), note);
++
++    std::vector<std::string> arguments;
++    for (const QString& argument : QCoreApplication::arguments().mid(1)) {
++        arguments.push_back(argument.toStdString());
++    }
++    QStringList kept;
++    for (const std::string& argument : UpdateInstaller::RestartArguments(arguments)) {
++        kept.push_back(QString::fromStdString(argument));
++    }
++    QProcess process;
++    process.setProgram(QString::fromStdString(appimage.string()));
++    process.setArguments(kept);
++    process.setProcessEnvironment(environment);
++    process.setWorkingDirectory(QDir::currentPath());
++    if (!process.startDetached()) {
++        QMessageBox::warning(window, Tr("Tuxchii Update"),
++                             Tr("Tuxchii was updated, but could not restart. Please start it "
++                                "again yourself."));
++        return;
++    }
++    LOG_INFO(Frontend, "Restarting {}", appimage.string());
++    if (window) {
++        QMetaObject::invokeMethod(window, &QWidget::close, Qt::QueuedConnection);
++    }
++}
++
++void AskRestart(QWidget* window, const fs::path& appimage, const QString& done, const QString& note) {
++    QMessageBox box(QMessageBox::Information, Tr("Tuxchii Update"), done, QMessageBox::NoButton,
++                    window);
++    box.setInformativeText(Tr("Restart Tuxchii now to use it?"));
++    QPushButton* restart = box.addButton(Tr("Restart Now"), QMessageBox::AcceptRole);
++    box.addButton(Tr("Later"), QMessageBox::RejectRole);
++    box.setDefaultButton(restart);
++    box.exec();
++    if (box.clickedButton() == restart) {
++        Restart(window, appimage, note);
++    }
++}
++
++/// Downloads, checks and installs `release` over the running AppImage.
++void Install(QWidget* window, const Release& release) {
++    const fs::path appimage = AppImagePath();
++    const fs::path part = appimage.parent_path() / ".Tuxchii-update.part";
++    std::error_code ec;
++    const auto fail = [&](const QString& why) {
++        fs::remove(part, ec);
++        LOG_ERROR(Frontend, "Tuxchii update failed: {}", why.toStdString());
++        QMessageBox::warning(window, Tr("Tuxchii Update"),
++                             Tr("The update could not be installed: %1\n\nTuxchii was not "
++                                "changed. You can download it from the release page instead.")
++                                 .arg(why));
++    };
++
++    // The expected SHA-256, published next to the AppImage.
++    std::string sha256_text;
++    if (const std::string error = Get(release.sha256_url.toStdString(),
++                                      [&](const char* data, size_t length) {
++                                          sha256_text.append(data, length);
++                                          return sha256_text.size() < 4096;
++                                      });
++        !error.empty()) {
++        fail(QString::fromStdString(error));
++        return;
++    }
++    const QString expected = QString::fromStdString(sha256_text).section(QLatin1Char(' '), 0, 0).trimmed().toLower();
++    if (expected.size() != 64) {
++        fail(Tr("the release's checksum file is not valid"));
++        return;
++    }
++
++    QProgressDialog progress(Tr("Downloading %1...").arg(Describe(release)), Tr("Cancel"), 0, 1000,
++                             window);
++    progress.setWindowTitle(Tr("Tuxchii Update"));
++    progress.setWindowModality(Qt::WindowModal);
++    progress.setMinimumDuration(0);
++    progress.setValue(0);
++    QApplication::processEvents();
++
++    std::ofstream out(part, std::ios::binary | std::ios::trunc);
++    if (!out) {
++        fail(Tr("could not write to %1").arg(QString::fromStdString(part.parent_path().string())));
++        return;
++    }
++    QCryptographicHash hash(QCryptographicHash::Sha256);
++    qint64 received = 0;
++    bool canceled = false;
++    const std::string error =
++        Get(release.appimage_url.toStdString(), [&](const char* data, size_t length) {
++            out.write(data, static_cast<std::streamsize>(length));
++            hash.addData(QByteArrayView{data, static_cast<qsizetype>(length)});
++            received += static_cast<qint64>(length);
++            if (release.size > 0) {
++                progress.setValue(static_cast<int>(std::min<qint64>(received * 1000 / release.size, 999)));
++            }
++            QApplication::processEvents();
++            if (progress.wasCanceled()) {
++                canceled = true;
++                return false;
++            }
++            return static_cast<bool>(out);
++        });
++    out.close();
++    progress.close();
++    if (canceled) {
++        fs::remove(part, ec);
++        return;
++    }
++    if (!error.empty()) {
++        fail(QString::fromStdString(error));
++        return;
++    }
++    if ((release.size > 0 && received != release.size) ||
++        QString::fromLatin1(hash.result().toHex()) != expected) {
++        fail(Tr("the download does not match the release's checksum"));
++        return;
++    }
++    fs::permissions(part, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec |
++                              fs::perms::others_read | fs::perms::others_exec,
++                    ec);
++
++    // Keep the running version for Roll Back, then put the new one in its place.
++    const fs::path backup = BackupPath(appimage);
++    fs::remove(backup, ec);
++    fs::rename(appimage, backup, ec);
++    if (ec) {
++        fail(QString::fromStdString(ec.message()));
++        return;
++    }
++    fs::rename(part, appimage, ec);
++    if (ec) {
++        std::error_code undo;
++        fs::rename(backup, appimage, undo);
++        fail(QString::fromStdString(ec.message()));
++        return;
++    }
++    LOG_INFO(Frontend, "Installed {} over {}", release.appimage.toStdString(), appimage.string());
++    const QString installed = Tr("%1 is installed.").arg(Describe(release));
++    AskRestart(window, appimage, installed, installed);
++}
++
++void RollBack(QWidget* window) {
++    const fs::path appimage = AppImagePath();
++    const fs::path backup = BackupPath(appimage);
++    if (QMessageBox::question(window, Tr("Tuxchii Update"),
++                              Tr("Go back to the version you had before the last update? Your "
++                                 "settings, saves and games are not affected.")) !=
++        QMessageBox::Yes) {
++        return;
++    }
++    const fs::path swap = appimage.parent_path() / ".Tuxchii-rollback.part";
++    std::error_code ec;
++    fs::rename(backup, swap, ec);
++    if (!ec) {
++        fs::rename(appimage, backup, ec);
++    }
++    if (!ec) {
++        fs::rename(swap, appimage, ec);
++    }
++    if (ec) {
++        QMessageBox::warning(window, Tr("Tuxchii Update"),
++                             Tr("Could not roll back: %1").arg(QString::fromStdString(ec.message())));
++        return;
++    }
++    const QString done = Tr("The previous version is back.");
++    AskRestart(window, appimage, done, done);
++}
++
++void Offer(QWidget* window, const Release& release) {
++    const fs::path appimage = AppImagePath();
++    const bool can_install = CanReplace(appimage);
++    QMessageBox box(QMessageBox::Information, Tr("Tuxchii Update"),
++                    Tr("<b>%1 is available.</b> You have %2.")
++                        .arg(Describe(release), RunningVersion()),
++                    QMessageBox::NoButton, window);
++    box.setInformativeText(
++        can_install
++            ? Tr("Tuxchii downloads it from GitHub (%1 MB), checks it, replaces this AppImage "
++                 "and restarts. The current version is kept as %2 so you can roll back.")
++                  .arg(release.size / (1024 * 1024))
++                  .arg(QString::fromStdString(BackupPath(appimage).filename().string()))
++            : appimage.empty()
++                  ? Tr("This copy isn't running as an AppImage, so it can't update itself. "
++                       "Download the new AppImage from the release page.")
++                  : Tr("Tuxchii can't write to its folder (%1), so it can't update itself. "
++                       "Download the new AppImage from the release page.")
++                        .arg(QString::fromStdString(appimage.parent_path().string())));
++    QPushButton* update = can_install ? box.addButton(Tr("Update Now"), QMessageBox::AcceptRole)
++                                      : box.addButton(Tr("Open Release Page"), QMessageBox::AcceptRole);
++    QPushButton* notes = can_install ? box.addButton(Tr("Release Notes"), QMessageBox::HelpRole)
++                                     : nullptr;
++    QPushButton* later = box.addButton(Tr("Remind Me Tomorrow"), QMessageBox::RejectRole);
++    QPushButton* skip = box.addButton(Tr("Skip This Version"), QMessageBox::DestructiveRole);
++    box.setDefaultButton(update);
++    box.setEscapeButton(later);
++    for (;;) {
++        box.exec();
++        if (notes && box.clickedButton() == notes) {
++            QDesktopServices::openUrl(QUrl(release.page));
++            continue;
++        }
++        break;
++    }
++    const auto now = static_cast<unsigned long long>(QDateTime::currentSecsSinceEpoch());
++    if (box.clickedButton() == update) {
++        if (can_install) {
++            Install(window, release);
++        } else {
++            QDesktopServices::openUrl(QUrl(release.page));
++        }
++    } else if (box.clickedButton() == skip) {
++        UISettings::values.skipped_update_tag = SkipKey(release).toStdString();
++    } else {
++        UISettings::values.update_remind_at = now + 24 * 60 * 60;
++    }
++}
++
++/// Offers the update as soon as no game is running.
++void OfferWhenFree(QPointer<QWidget> window, Release release, std::function<bool()> can_offer) {
++    if (!window) {
++        return;
++    }
++    if (!can_offer() || QApplication::activeModalWidget() != nullptr) {
++        QTimer::singleShot(5000, window, [window, release, can_offer] {
++            OfferWhenFree(window, release, can_offer);
++        });
++        return;
++    }
++    Offer(window, release);
++}
++
++void Handle(QWidget* window, bool manual, const CheckResult& result,
++            std::function<bool()> can_offer) {
++    if (!result.error.isEmpty()) {
++        LOG_WARNING(Frontend, "Tuxchii update check failed: {}", result.error.toStdString());
++        if (manual) {
++            QMessageBox::warning(window, Tr("Check for Updates"),
++                                 Tr("Could not check for updates: %1").arg(result.error));
++        }
++        return;
++    }
++    if (!result.update) {
++        if (!manual) {
++            return;
++        }
++        QMessageBox box(QMessageBox::Information, Tr("Check for Updates"),
++                        Tr("You have the latest version (Tuxchii %1).").arg(RunningVersion()),
++                        QMessageBox::Ok, window);
++        std::error_code ec;
++        const fs::path appimage = AppImagePath();
++        QPushButton* roll_back = nullptr;
++        if (CanReplace(appimage) && fs::is_regular_file(BackupPath(appimage), ec)) {
++            roll_back = box.addButton(Tr("Roll Back to Previous Version..."),
++                                      QMessageBox::ActionRole);
++        }
++        box.exec();
++        if (roll_back && box.clickedButton() == roll_back) {
++            RollBack(window);
++        }
++        return;
++    }
++    const Release& release = *result.update;
++    const auto now = static_cast<unsigned long long>(QDateTime::currentSecsSinceEpoch());
++    if (!manual && (UISettings::values.skipped_update_tag.GetValue() == SkipKey(release).toStdString() ||
++                    UISettings::values.update_remind_at.GetValue() > now)) {
++        return;
++    }
++    OfferWhenFree(window, release, std::move(can_offer));
++}
++
++} // Anonymous namespace
++
++void Check(QWidget* window, bool manual, std::function<bool()> can_offer) {
++    static bool checking = false;
++    if (checking) {
++        return;
++    }
++    checking = true;
++    auto* watcher = new QFutureWatcher<CheckResult>(window);
++    QObject::connect(watcher, &QFutureWatcher<CheckResult>::finished, window,
++                     [window, watcher, manual, can_offer = std::move(can_offer)] {
++                         checking = false;
++                         const CheckResult result = watcher->result();
++                         watcher->deleteLater();
++                         Handle(window, manual, result, can_offer);
++                     });
++    watcher->setFuture(QtConcurrent::run(FetchLatest));
++}
++
++} // namespace Tuxchii::Updater
++
++#else
++
++namespace Tuxchii::Updater {
++void Check(QWidget*, bool, std::function<bool()>) {}
++} // namespace Tuxchii::Updater
++
++#endif
+diff --git a/src/yuzu/tuxchii_updater.h b/src/yuzu/tuxchii_updater.h
+new file mode 100644
+index 0000000000..2e1f356ed2
+--- /dev/null
++++ b/src/yuzu/tuxchii_updater.h
+@@ -0,0 +1,20 @@
++// SPDX-FileCopyrightText: Copyright 2026 Tuxchii contributors
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Linux build patch (Tuxchii): updates the AppImage from Tuxchii's own GitHub releases, in place of
++// Fritchii's updater, which only installs Fritchii's Windows zip.
++
++#pragma once
++
++#include <functional>
++
++class QWidget;
++
++namespace Tuxchii::Updater {
++
++/// Looks for a newer Tuxchii AppImage on GitHub and offers it. `manual` is set when the player
++/// asked (Help > Check for Updates): then "up to date" and failures are shown too. An update is only
++/// offered while `can_offer` returns true (no game running); otherwise it waits.
++void Check(QWidget* window, bool manual, std::function<bool()> can_offer);
++
++} // namespace Tuxchii::Updater
