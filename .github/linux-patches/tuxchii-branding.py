@@ -62,8 +62,6 @@ EDEN_SELF = [
      'fmt::format("{} | {}-{} (Vulkan)",'),
     ("src/yuzu_cmd/emu_window/emu_window_sdl3_null.cpp", '(Vulkan)", Common::g_build_name,',
      '(Vulkan)", "Tuxchii",'),
-    # Frizti's Discord keeps its name in a link; the menu entry says what it is instead.
-    ("src/yuzu/fritchii/fritchii_ui.cpp", 'tr("Fritchii &Discord")', 'tr("Community &Discord")'),
     # Linux problems are reported on this repository's GitHub issues.
     ("src/yuzu/util/export_log.cpp",
      '"Drag this file into your post in the Fritchii Discord issues, or send it to Frizti."',
@@ -79,6 +77,14 @@ BUILD_NAME_SHOWN = [
     (r"std::string\{Common::g_build_name\}", 'std::string{"Tuxchii"}'),
     (r"QString::from(?:Latin1|Utf8)\(Common::g_build_name\)", 'QStringLiteral("Tuxchii")'),
     (r"^(\s*)Common::g_build_name,", r'\1"Tuxchii",'),
+]
+
+# Removed outright: the Discord entries (Help menu and the home screen of Fritchii's interface).
+REMOVE_LINES = [
+    ("src/yuzu/fritchii/fritchii_ui.cpp", r"^.*\bauto\* discord = new QAction\(.*\n"),
+    ("src/yuzu/fritchii/fritchii_ui.cpp", r"^.*QObject::connect\(discord,.*\n"),
+    ("src/yuzu/fritchii/fritchii_ui.cpp", r"^.*insertAction\([^,]+, discord\);\n"),
+    ("src/yuzu/fritchii/home.cpp", r"^.*addWidget\(link\([^\n]*&OpenDiscord\)\);\n"),
 ]
 
 # The About dialog keeps one line crediting the projects Tuxchii is built from.
@@ -145,6 +151,9 @@ def main():
         for f, a, b in EDEN_SELF:
             if rel == f:
                 new = new.replace(a, b)
+        for f, pattern in REMOVE_LINES:
+            if rel == f:
+                new = re.sub(pattern, "", new, flags=re.M)
         if path.suffix == ".md":  # the "What's new" window
             new = rename(new)
         elif path.suffix == ".ui":
