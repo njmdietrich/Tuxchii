@@ -123,6 +123,8 @@ add_library(video_core STATIC
     nx2_list_macro_trace.h
     nx2_cmdpage_diag.h
     nx2_debug_control.cpp
+    nx2_recipe.cpp
+    nx2_recipe.h
     nx2_debug_control.h
     nx2_fast_draw.cpp
     nx2_fast_draw.h
@@ -189,6 +191,7 @@ add_library(video_core STATIC
     renderer_vulkan/pipeline_build_failure.h
     renderer_vulkan/pipeline_build_trace.h
     renderer_vulkan/pipeline_eviction_policy.h
+    renderer_vulkan/precache_journal.h
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_optimization.h
     renderer_vulkan/pipeline_shader_emission.h

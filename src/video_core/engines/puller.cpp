@@ -181,6 +181,64 @@ void VerifyWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     }
 }
 
+// Ocarina of Time's flip counters: the words of device block 0xd6d2000-0xd6d204c advance only
+// through fence-carried payload releases, as a ring 19 deep. Two ways an AcquireEqual on them
+// never returns (every GPU channel then waits and the game hangs; approach from Eglantine #712):
+// the word already went past the value (the channels aren't ordered against the writers as on
+// hardware), or the channels that carry the next round's releases wait behind such an acquire.
+// Called after a drain, so the back ran all the work sent before the acquire. Returns whether
+// this acquire was let through. EDEN_NX2_OOT_SEM_RESCUE=0 turns this off.
+bool RescueOcarinaFlipCounter(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
+                              u32 current) {
+    constexpr u64 OcarinaProgramId = 0x0400486024DEC000ULL;
+    constexpr u64 BlockBegin = 0xd6d2000;
+    constexpr u64 BlockEnd = 0xd6d204c;
+    constexpr u32 MaxAhead = 0x40;
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_OOT_SEM_RESCUE");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled || acquire.operation != Nx2SemaphoreWaiters::AcquireEqual ||
+        Settings::GetCurrentProgramID() != OcarinaProgramId) {
+        return false;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+    if (!device || *device < BlockBegin || *device >= BlockEnd) {
+        return false;
+    }
+    const auto waited = std::chrono::steady_clock::now() - acquire.since;
+    if (waited < std::chrono::milliseconds{10}) {
+        return false;
+    }
+    // The first 16 of each kind, then every 256th.
+    const auto should_log = [](std::atomic<u32>& counter) {
+        const u32 count = counter.fetch_add(1, std::memory_order_relaxed);
+        return count < 16 || count % 256 == 0;
+    };
+    if (static_cast<s32>(current - acquire.value) > 0) {
+        if (static std::atomic<u32> passed{}; should_log(passed)) {
+            LOG_INFO(HW_GPU, "Channel {} flip counter {:#x}: wanted {:#x}, passed at {:#x} ({} times)",
+                     dma_pusher.channel_state.bind_id, *device, acquire.value, current,
+                     passed.load(std::memory_order_relaxed));
+        }
+        return true;
+    }
+    // 100 ms is above normal frame pacing; a slow back (a shader build) had time to run the
+    // release.
+    const u32 ahead = acquire.value - current;
+    if (waited < std::chrono::milliseconds{100} || ahead == 0 || ahead > MaxAhead) {
+        return false;
+    }
+    dma_pusher.memory_manager.Write<u32>(acquire.address, acquire.value);
+    Nx2SemaphoreWaiters::Get().OnWrite(*device, acquire.value);
+    if (static std::atomic<u32> completed{}; should_log(completed)) {
+        LOG_WARNING(HW_GPU, "Channel {} flip counter {:#x}: completed round {:#x} -> {:#x} ({} times)",
+                    dma_pusher.channel_state.bind_id, *device, current, acquire.value,
+                    completed.load(std::memory_order_relaxed));
+    }
+    return true;
+}
+
 } // Anonymous namespace
 
 bool Puller::PendingAcquire::Matches(u32 current) const {
@@ -270,6 +328,9 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
             pending_acquire->Matches(ReadSemaphoreWord(dma_pusher, pending_acquire->address))) {
             return true;
         }
+    }
+    if (RescueOcarinaFlipCounter(dma_pusher, *pending_acquire, current)) {
+        return true;
     }
     if (!pending_acquire->reported &&
         std::chrono::steady_clock::now() - pending_acquire->since > std::chrono::seconds{2}) {

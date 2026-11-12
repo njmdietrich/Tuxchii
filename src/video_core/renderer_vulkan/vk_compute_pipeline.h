@@ -99,6 +99,11 @@ public:
     /// Advances the frame window of EDEN_NX2_UPSCALER_TRACE
     static void TickUpscalerTrace();
 
+    /// Whether the driver build has finished (or failed: then IsBound is false)
+    [[nodiscard]] bool IsBuilt() const noexcept {
+        return is_built.load(std::memory_order::acquire);
+    }
+
     /// Whether no build of this pipeline is left queued on a worker thread, which holds it
     [[nodiscard]] bool IsBuildTaskDone() const noexcept {
         return !jobs || job.Ready();
@@ -107,6 +112,24 @@ public:
     /// Builds it on this thread, for a pipeline made with PipelineBuildQueue::owner_builds
     void Build() {
         RunBuild();
+    }
+
+    [[nodiscard]] const Shader::Info& StageInfo() const noexcept {
+        return info;
+    }
+
+    /// Built from a precompiled pipeline's kept info and SPIR-V; a failed build is replaced by a
+    /// pipeline translated from the game's state.
+    void MarkPrecompiled() noexcept {
+        precompiled = true;
+    }
+    [[nodiscard]] bool IsPrecompiled() const noexcept {
+        return precompiled;
+    }
+    /// Built, and its module could not be made (its emit function threw): dispatches skip it.
+    [[nodiscard]] bool BuildFailed() const noexcept {
+        return is_built.load(std::memory_order::acquire) &&
+               build_failed.load(std::memory_order::acquire);
     }
 
 private:
@@ -136,6 +159,9 @@ private:
     vk::PipelineLayout pipeline_layout;
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
+
+    bool precompiled{};
+    std::atomic_bool build_failed{false};
 
     std::function<void()> build_task;
     std::atomic_bool build_claimed{false};

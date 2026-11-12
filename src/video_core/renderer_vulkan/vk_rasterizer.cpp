@@ -28,6 +28,7 @@
 
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
+#include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
@@ -318,14 +319,22 @@ void RasterizerVulkan::ReadMeshEmulationProbe() {
     };
     u64 triangles{}, degenerate{}, outside{}, bad_index{};
     std::string sample;
+    const u32 corners{probe.primitive_vertices};
     for (u32 group = 0; group < probe.groups; ++group) {
         const u64 base{u64{group} * probe.block_words};
         const u64 index_base{base + u64{probe.max_vertices} * probe.vertex_lines};
         for (u32 primitive = 0; primitive < probe.max_primitives; ++primitive) {
-            const std::array<u32, 3> indices{word(index_base + primitive * 3),
-                                             word(index_base + primitive * 3 + 1),
-                                             word(index_base + primitive * 3 + 2)};
-            if (indices[0] == indices[1] && indices[1] == indices[2]) {
+            std::array<u32, 3> storage{};
+            for (u32 corner = 0; corner < corners; ++corner) {
+                storage[corner] = word(index_base + u64{primitive} * corners + corner);
+            }
+            const std::span<const u32> indices{storage.data(), corners};
+            // Slots past the primitive count: 0 0 0 for triangles, the unused marker otherwise.
+            const bool unused{
+                corners == 3
+                    ? indices[0] == indices[1] && indices[1] == indices[2]
+                    : indices[0] == Shader::Backend::SPIRV::MESH_EMULATION_UNUSED_VERTEX};
+            if (unused) {
                 ++degenerate;
                 continue;
             }
@@ -353,9 +362,9 @@ void RasterizerVulkan::ReadMeshEmulationProbe() {
         }
     }
     LOG_INFO(Render_Vulkan,
-             "Mesh emulation probe frame {}: {} groups, {} triangles ({} degenerate slots), {} "
-             "with every vertex off screen, {} with a bad index; first triangles:{}",
-             probe.frame, probe.groups, triangles, degenerate, outside, bad_index, sample);
+             "Mesh emulation probe frame {}: {} groups, {} primitives of {} vertices ({} unused "
+             "slots), {} with every vertex off screen, {} with a bad index; first primitives:{}",
+             probe.frame, probe.groups, triangles, corners, degenerate, outside, bad_index, sample);
 }
 
 const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
@@ -1164,6 +1173,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 .vertex_lines = setup.vertex_lines,
                 .max_vertices = setup.max_vertices,
                 .max_primitives = setup.max_primitives,
+                .primitive_vertices = setup.primitive_vertices,
                 .position_lines = setup.position_lines,
                 .pending = true,
             };
@@ -2583,11 +2593,27 @@ bool RasterizerVulkan::IsGpuTickDone(u64 tick) {
     if (scheduler.IsFree(tick)) {
         return true;
     }
+    // The GPU thread polls a channel suspended on a list copy back to back (it spins for 500 us
+    // before it sleeps): ~190,000 polls a second on Windows. Each asked the back to submit (a
+    // futex wake, a kernel call on Windows) and the driver for the semaphore's value (also a
+    // kernel call there). Both are needed far less often than that.
+    const auto now = std::chrono::steady_clock::now();
     // A deferred submission (Scheduler::DeferFlush) is only made by the split's back: ask it to
-    // submit, or the tick never completes while the front polls.
-    if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active()) {
+    // submit, or the tick never completes while the front polls. Once per tick is enough (the
+    // hook submits everything deferred, so also every earlier tick); again after a millisecond
+    // in case it raced.
+    if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active() &&
+        (tick > poll_submit_requested_tick ||
+         now - poll_submit_requested_at > std::chrono::milliseconds{1})) {
         VideoCommon::GpuSplit::Get().RequestIdleHook();
+        poll_submit_requested_tick = (std::max)(poll_submit_requested_tick, tick);
+        poll_submit_requested_at = now;
     }
+    // The GPU's progress, from the driver at most every 20 us (a copy takes longer than that).
+    if (now - poll_refreshed_at < std::chrono::microseconds{20}) {
+        return false;
+    }
+    poll_refreshed_at = now;
     scheduler.GetMasterSemaphore().Refresh();
     return scheduler.IsFree(tick);
 }

@@ -85,10 +85,10 @@ the game keeps its own pass whenever DLSS is off, unavailable or fails to start.
   Samplers pick the biased or unbiased variant at each bind, so a console mode switch takes
   effect in-session. Images the GPU wrote (render targets: bloom, blur, reflections, fog) keep
   the game's own bias.
-- FSR 4 (Windows, AMD's driver, off by default): with "Use AMD FSR 4 in place of FSR 3.1" on,
+- FSR 4 on Windows (AMD's driver, off by default): with "Use AMD FSR 4 in place of FSR 3.1" on,
   the same inputs, jitter and RCAS setting go to AMD's FSR 4 through AMD's FidelityFX runtime
-  (FidelityFX SDK 2.4.0, FSR Upscaling 4.1.2). Nothing of AMD's ships with Lichii: the setting's
-  panel downloads `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` from
+  (FidelityFX SDK 2.4.0, FSR Upscaling 4.1.2). Nothing of AMD's ships with the Windows build: the
+  setting's panel downloads `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` from
   the SDK's GitHub repository at the release commit into the user folder's `fidelityfx` folder,
   after showing AMD's licence. Each file must match its pinned size and SHA-256
   (`vulkan_common/ffx_files.h`) and carry AMD's Authenticode signature, checked after the
@@ -106,15 +106,16 @@ the game keeps its own pass whenever DLSS is off, unavailable or fails to start.
   SDK 2.3.0 it extracts them from (listed under MIT in the SDK's `license.md`). Both x86-64 Linux
   packages carry `usr/lib/amd_fidelityfx_upscaler_vk.so` and, in `usr/share/licenses/fsr4-vk`,
   fsr4-vk's licences and AMD's SDK licence. The aarch64 packages don't: fsr4-vk's shader
-  conversion fails its own asset check on arm64 hosts. A build without it loads the library from the user
-  folder's `fidelityfx` folder. The setting is shown for RDNA 2 and newer Radeons on RADV
+  conversion fails its own asset check on arm64 hosts. The loader first checks
+  `EDEN_NX2_FSR4_LIB`, then the user folder's `fidelityfx` folder, the packaged `usr/lib` folder,
+  and next to the executable. `EDEN_NX2_FSR4_LIB` enables FSR 4 without the setting. The setting is shown for RDNA 2 and newer Radeons on RADV
   (`VideoCommon::IsFsr4PortGpu`). At boot `VideoCommon::CheckFsr4Port` checks what fsr4-vk's
   shaders use on the created device (descriptor buffers, synchronization2, 32-lane compute
   subgroups, 8/16-bit arithmetic with integer dot products, linear compute derivatives) and picks
   the network: FP8 with FP16/FP8 cooperative matrices, `shaderFloat8` and the matrix conversions
   of `VK_NV_cooperative_matrix2` (RADV exposes it only with its `radv_cooperative_matrix2_nv`
   option), INT8 otherwise. Lichii asks fsr4-vk for that model by version. The extra device
-  features are enabled only while the setting is on with RADV. Anything missing, a missing
+  features are enabled only while FSR 4 is requested on RADV. Anything missing, a missing
   library or a failed context or dispatch leaves FSR 3.1 running, and the log names the active
   upscaler and why. Ported from #915's loader; untested on AMD hardware so far.
 - #644 (`82494c4820`, `74a2d20c90`, `4352c06bbf`) supplies the effects capture, used by FSR only

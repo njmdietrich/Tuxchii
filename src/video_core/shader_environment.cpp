@@ -47,6 +47,8 @@
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/texture.h"
+#include "shader_recompiler/byte_addressed_image.h"
+#include "video_core/surface.h"
 
 namespace VideoCommon {
 
@@ -490,11 +492,7 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
         return entry;
     }
     const GPUVAddr descriptor_addr{tic_addr + index * sizeof(Tegra::Texture::TICEntry)};
-    if (texture_pool_flushed) {
-        gpu_memory->ReadBlockUnsafe(descriptor_addr, &entry, sizeof(entry));
-    } else {
-        gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
-    }
+    gpu_memory->ReadBlockUnsafe(descriptor_addr, &entry, sizeof(entry));
     if (entry.format.Value() == Tegra::Texture::TextureFormat{} &&
         std::getenv("EDEN_NX2_RENDER_TRACE")) {
         static std::atomic<u32> traces{};
@@ -515,6 +513,25 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
 }
 
 namespace {
+
+// NVN keeps the draw's base vertex, base instance and draw ID in c0 0x640/0x644/0x648 (the HLE
+// draw macros map the same slots). Read them from the draw instead: the c0 copy a shader sees can
+// lag the macro's writes, which dropped Ocarina of Time's instanced vegetation.
+std::optional<Shader::ReplaceConstant> ForcedDrawParameter(u32 bank, u32 offset) {
+    if (bank != 0) {
+        return std::nullopt;
+    }
+    switch (offset) {
+    case 0x640:
+        return Shader::ReplaceConstant::BaseVertex;
+    case 0x644:
+        return Shader::ReplaceConstant::BaseInstance;
+    case 0x648:
+        return Shader::ReplaceConstant::DrawID;
+    default:
+        return std::nullopt;
+    }
+}
 
 // Reads a native program a 4 KiB page at a time instead of one 16-byte instruction at a time.
 // Each page is read with ReadBlock, so GPU-written code is flushed first, once per page instead
@@ -992,6 +1009,9 @@ u32 GraphicsEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
 
 std::optional<Shader::ReplaceConstant> GraphicsEnvironment::GetReplaceConstBuffer(u32 bank,
                                                                                   u32 offset) {
+    if (const auto forced = ForcedDrawParameter(bank, offset)) {
+        return forced;
+    }
     if (!has_hle_engine_state) {
         return std::nullopt;
     }
@@ -1287,6 +1307,116 @@ size_t FileEnvironment::MemorySize() const {
            map_bytes(storage_pointer_types) + map_bytes(cbuf_replacements);
 }
 
+namespace {
+/// What translation uses of a pixel format (texture_pass.cpp): whether it is an integer format,
+/// R16_FLOAT and the byte-addressed 32-bit color formats (byte-addressed image stores), the snorm
+/// formats (texel fetch patching without snorm render buffers).
+u32 PixelFormatTraits(Shader::TexturePixelFormat format) {
+    using F = Shader::TexturePixelFormat;
+    const bool snorm = format == F::A8B8G8R8_SNORM || format == F::R8G8_SNORM ||
+                       format == F::R8_SNORM || format == F::R16G16B16A16_SNORM ||
+                       format == F::R16G16_SNORM || format == F::R16_SNORM;
+    return (VideoCore::Surface::IsPixelFormatInteger(
+                static_cast<VideoCore::Surface::PixelFormat>(format))
+                ? 1U
+                : 0U) |
+           (format == F::R16_FLOAT ? 2U : 0U) |
+           (Shader::IsByteAddressed32BitColorFormat(format) ? 4U : 0U) | (snorm ? 8U : 0U);
+}
+} // Anonymous namespace
+
+bool FileEnvironment::AnswersHoldFor(Shader::Environment& live, const char** why,
+                                     u32 format_traits) {
+    const auto fail = [why](const char* reason) {
+        if (why) {
+            *why = reason;
+        }
+        return false;
+    };
+    if (live.ShaderStage() != stage || live.StartAddress() != start_address ||
+        live.LocalMemorySize() != local_memory_size) {
+        return fail("program");
+    }
+    // Only a vertex program asks (PositionPass).
+    if (stage == Shader::Stage::VertexB &&
+        live.ReadViewportTransformState() != viewport_transform_state) {
+        return fail("viewport transform");
+    }
+    // Handles of non-bindless textures are read from this constant buffer.
+    if (live.TextureBoundBuffer() != texture_bound) {
+        return fail("texture bound buffer");
+    }
+    // A passthrough geometry program passes the attributes this mask does not skip.
+    if (stage == Shader::Stage::Geometry && live.GpPassthroughMask() != gp_passthrough_mask) {
+        return fail("geometry passthrough mask");
+    }
+    // HLE replacements are asked for every constant buffer read when there are any.
+    if (live.HasHLEMacroState() || HasHLEMacroState()) {
+        return fail("HLE constant replacements");
+    }
+    const auto is_pointer_word = [&](u64 key) {
+        const u32 index = static_cast<u32>(key >> 32);
+        const u32 offset = static_cast<u32>(key);
+        return storage_pointer_types.contains(MakeCbufKey(index, offset)) ||
+               (offset >= 4 && storage_pointer_types.contains(MakeCbufKey(index, offset - 4)));
+    };
+    std::vector<u32> handles_read;
+    for (const auto& [key, value] : cbuf_values) {
+        const u32 index = static_cast<u32>(key >> 32);
+        const u32 offset = static_cast<u32>(key);
+        const u32 live_value = live.ReadCbufValue(index, offset);
+        const auto type = texture_types.find(value);
+        const auto format = texture_pixel_formats.find(value);
+        if (type != texture_types.end() || format != texture_pixel_formats.end()) {
+            // A texture handle. Asked of `live` even when it is the same value, so `live` holds
+            // the answers its translation would have asked for (it is what the disk cache keeps).
+            if (type != texture_types.end() && live.ReadTextureType(live_value) != type->second) {
+                return fail("texture type");
+            }
+            if (format != texture_pixel_formats.end() &&
+                ((PixelFormatTraits(live.ReadTexturePixelFormat(live_value)) ^
+                  PixelFormatTraits(format->second)) &
+                 format_traits) != 0) {
+                return fail("texture pixel format");
+            }
+            handles_read.push_back(value);
+            continue;
+        }
+        if (live_value != value && !is_pointer_word(key)) {
+            return fail("constant buffer value");
+        }
+    }
+    const auto read_from_cbuf = [&](u32 handle) {
+        return std::ranges::find(handles_read, handle) != handles_read.end();
+    };
+    // Handles not read from a constant buffer (or built from several words): asked as they are.
+    for (const auto& [handle, type] : texture_types) {
+        if (!read_from_cbuf(handle) && live.ReadTextureType(handle) != type) {
+            return fail("texture type");
+        }
+    }
+    for (const auto& [handle, format] : texture_pixel_formats) {
+        if (!read_from_cbuf(handle) &&
+            ((PixelFormatTraits(live.ReadTexturePixelFormat(handle)) ^ PixelFormatTraits(format)) &
+             format_traits) != 0) {
+            return fail("texture pixel format");
+        }
+    }
+    for (const auto& [key, mapped] : storage_pointer_types) {
+        const u32 index = static_cast<u32>((key >> 32) & ((key >> 63) != 0 ? 0xff : 0xffffffff));
+        const u32 offset = static_cast<u32>(key);
+        const bool live_mapped =
+            (key >> 63) != 0
+                ? live.IsCbufIndirectStorageBufferPointer(index, offset,
+                                                          static_cast<u32>((key >> 40) & 0x3fffff))
+                : live.IsCbufStorageBufferPointer(index, offset);
+        if (live_mapped != (mapped != 0)) {
+            return fail("storage buffer pointer");
+        }
+    }
+    return true;
+}
+
 void FileEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
     DumpImpl(pipeline_hash, shader_hash, code, read_highest, read_lowest, initial_offset, stage);
 }
@@ -1412,6 +1542,9 @@ std::array<u32, 3> FileEnvironment::WorkgroupSize() const {
 
 std::optional<Shader::ReplaceConstant> FileEnvironment::GetReplaceConstBuffer(u32 bank,
                                                                               u32 offset) {
+    if (const auto forced = ForcedDrawParameter(bank, offset)) {
+        return forced;
+    }
     const u64 key = (static_cast<u64>(bank) << 32) | static_cast<u64>(offset);
     auto it = cbuf_replacements.find(key);
     if (it == cbuf_replacements.end()) {

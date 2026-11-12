@@ -335,6 +335,7 @@ struct BufferCacheTestAccess {
     }
     static void NextFrame(Cache& cache) {
         cache.native_indirect_uniforms_this_frame.clear();
+        cache.native_indirect_uniform_ranges_this_frame.Clear();
     }
     static u32 CpuMarks(Cache& cache) {
         return cache.memory_tracker.cpu_marks;

@@ -6,11 +6,13 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <string_view>
 #include <thread>
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
@@ -27,6 +29,7 @@
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "video_core/nx2_stutter_trace.h"
+#include "video_core/vulkan_common/ffx_runtime.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -493,13 +496,7 @@ namespace {
 /// the fsr4-vk port on Linux with RADV. They need float16 and, on RDNA 4, float8 on the device;
 /// the emulator's shaders use neither for it.
 bool WantsAmdFsr4(VkDriverId driver_id) {
-#ifdef _WIN32
-    return driver_id == VK_DRIVER_ID_AMD_PROPRIETARY && Settings::values.amd_fsr4.GetValue();
-#elif defined(__linux__) && !defined(__ANDROID__)
-    return driver_id == VK_DRIVER_ID_MESA_RADV && Settings::values.amd_fsr4.GetValue();
-#else
-    return false;
-#endif
+    return FfxRuntime::IsWanted(driver_id);
 }
 
 /// The fsr4-vk port's shaders use features the emulator's don't; they're enabled only for it.
@@ -511,6 +508,29 @@ bool WantsFsr4Port(VkDriverId driver_id) {
 #endif
 }
 } // Anonymous namespace
+
+bool Device::MesaShaderCacheEnabled() noexcept {
+    static const bool enabled = [] {
+        // Matches Mesa's boolean parsing of its environment options.
+        const auto set = [](const char* name) {
+            const char* value = std::getenv(name);
+            if (value == nullptr) {
+                return false;
+            }
+            const std::string_view v{value};
+            for (const std::string_view truthy : {"1", "true", "t", "yes", "y"}) {
+                if (std::ranges::equal(v, truthy, [](char a, char b) {
+                        return std::tolower(static_cast<unsigned char>(a)) == b;
+                    })) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        return !set("MESA_SHADER_CACHE_DISABLE") && !set("MESA_GLSL_CACHE_DISABLE");
+    }();
+    return enabled;
+}
 
 Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR surface,
                const vk::InstanceDispatch& dld_)
@@ -934,7 +954,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     functions.vkAllocateMemory = TimedAllocateMemory;
     functions.vkFreeMemory = TimedFreeMemory;
 
-    VmaAllocatorCreateFlags flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
+    // Synchronized inside VMA: the image recycler destroys dropped images on a thread of its own
+    // while the GPU thread allocates (vulkan_wrapper.cpp).
+    VmaAllocatorCreateFlags flags = 0;
     if (extensions.memory_budget) {
         flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
     }
@@ -974,6 +996,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     };
 
     vk::Check(vmaCreateAllocator(&allocator_info, &allocator));
+    vk::ImageRecycler::Open(allocator);
 
     owns_static_pipeline_cache = surface != VkSurfaceKHR{};
     LoadStaticPipelineCache();
@@ -997,6 +1020,7 @@ Device::~Device() {
             }
         }
     }
+    vk::ImageRecycler::Clear(allocator);
     vmaDestroyAllocator(allocator);
 }
 
@@ -1901,6 +1925,27 @@ void Device::RemoveUnsuitableExtensions() {
     // the compute fallback a device without it uses.
     if (extensions.mesh_shader && std::getenv("EDEN_NX2_FORCE_MESH_FALLBACK") != nullptr) {
         LOG_WARNING(Render_Vulkan, "EDEN_NX2_FORCE_MESH_FALLBACK: VK_EXT_mesh_shader disabled");
+        extensions.mesh_shader = false;
+    }
+    // The Mesh Shaders setting. Automatic leaves the extension disabled on AMD drivers: native
+    // task/mesh draws hang AMD GPUs (#316, #670, #672, #871). RADV resets the GPU on RX 6000, 7000
+    // and 9000 cards (Mesa 26.0 to 27.0-devel; 26.2.6 still hangs, though it recovers more often),
+    // and AMD's own driver times out on the Radeon 780M. The compute fallback avoids the hangs, but
+    // it can be slower in scenes full of foliage and skips the mesh programs it can't run
+    // (per-primitive outputs, primitives other than triangles, layered output). Native keeps the
+    // extension, for a setup that no longer hangs; Compute disables it on every device.
+    const Settings::MeshShaderMode mesh_mode = Settings::values.mesh_shaders.GetValue();
+    const VkDriverId mesh_driver = properties.driver.driverID;
+    const bool amd_mesh_driver = mesh_driver == VK_DRIVER_ID_MESA_RADV ||
+                                 mesh_driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
+                                 mesh_driver == VK_DRIVER_ID_AMD_OPEN_SOURCE;
+    if (extensions.mesh_shader && mesh_mode == Settings::MeshShaderMode::Compute) {
+        LOG_INFO(Render_Vulkan, "Mesh Shaders setting: task/mesh draws use the compute fallback");
+        extensions.mesh_shader = false;
+    } else if (extensions.mesh_shader && mesh_mode == Settings::MeshShaderMode::Automatic &&
+               amd_mesh_driver) {
+        LOG_INFO(Render_Vulkan, "AMD driver: task/mesh draws use the compute fallback, because "
+                                "native mesh draws hang the GPU (Mesh Shaders: Native keeps them)");
         extensions.mesh_shader = false;
     }
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,

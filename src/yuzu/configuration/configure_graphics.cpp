@@ -381,16 +381,19 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             hold_graphics.emplace(setting->Id(), group);
 #endif
         } else if (setting->Id() == Settings::values.amd_fsr4.Id()) {
-            // AMD's files and a download button under the checkbox, shown for GPUs FSR 4 runs on.
+            // Shown for GPUs FSR 4 runs on. On Windows AMD's files and a download button go under
+            // the checkbox; Linux uses the library that ships with the build.
             amd_fsr4_group = new QWidget(this);
             QVBoxLayout* group_layout = new QVBoxLayout(amd_fsr4_group);
             group_layout->setContentsMargins(0, 0, 0, 0);
             group_layout->setSpacing(2);
             group_layout->addWidget(widget);
+#ifdef _WIN32
             AmdFsr4Panel* panel = new AmdFsr4Panel(amd_fsr4_group);
             group_layout->addWidget(panel);
             panel->setVisible(widget->checkbox->isChecked());
             connect(widget->checkbox, &QCheckBox::toggled, panel, &QWidget::setVisible);
+#endif
             hold_graphics.emplace(setting->Id(), amd_fsr4_group);
         } else if (setting->Id() == Settings::values.frame_gen.Id()) {
             frame_gen_checkbox = widget->checkbox;

@@ -5,6 +5,58 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
+## nx2 + Lichiistein Linux PGO integration
+
+This branch combines upstream Lichii `nx2` at `21d62e43ca` with Lichiistein at `8f55ee5593`,
+preserving both histories. Some Lichiistein changes already have newer upstream equivalents;
+those upstream implementations are retained. See [the integration notes](docs/nx2/lichiistein-integration.md).
+
+The `linux-x86_64-pgo` workflow builds only that platform variant, including the Qt frontend,
+CLI, and the fsr4-vk runtime with embedded shaders and models. Its AppImage and self-contained
+tar.gz are workflow artifacts; automatic update checks are disabled for these builds.
+
+The Lichiistein overview below describes the imported fork; its original base and testing
+reports are historical. Current upstream also supports FSR 4 on Linux.
+
+## Actually, Lichiistein was the name of the scientist.
+
+**Lichiistein** is an unofficial, personal fork of [Lichii](https://github.com/zortos293/Lichii), tuned for Ocarina of Time on AMD GPUs under Linux (RADV). 
+
+It is based on Lichii `nx2` at `093e264c8a` and adds work that hasn't landed upstream yet. Credit belongs to the original authors, whose commits are preserved in the history.
+
+**From open PRs and other forks**
+
+- GPU-thread and fast-draw work: #836, #806, #802, #784, #865, #875, #785
+- The mesh shader setting and fallback changes (#814)
+- The fix for flashes on Low/Default fences (#874)
+- On-disk shader precompilation (#895/#896)
+- #995, #976, #974, #954, #970, #959, #1076, #933, #1051, #1008, #1023 and #913
+- Eglantine-Community #673
+- Fritchii's ASTC bounds fix for AMD corruption and device loss
+
+**Added or adapted here**
+
+- A RADV patch that leaves pipeline caching to Mesa.
+- A rescue for Ocarina of Time's stuck flip counter, narrowed from Eglantine #712. It fixes a permanent hang seen when closing the quick menu in Hyrule Field. `EDEN_NX2_OOT_SEM_RESCUE=0` turns it off.
+- An opt-in guard against the NaN "stretched glowing geometry" bug, from PantACRO4life's Lichii branch: `EDEN_NX2_NAN_GUARD=all`. It's a workaround and hasn't been proven in long play.
+- A Skip button on the shader preparation screen.
+- Update checks that follow this fork's releases, not upstream Lichii's.
+
+**FSR 4**
+
+This integration retains upstream's current FSR 4 support and Lichiistein's Linux runtime override. Turn on **Use AMD FSR 4 in place of FSR 3.1** in the Graphics settings, with Ocarina of Time's FSR setting also on.
+
+- **Linux (RADV):** x86_64 release builds include `amd_fidelityfx_upscaler_vk.so`, built from [fsr4-vk](https://github.com/Astyyyyy/fsr4-vk) and AMD's FSR 4.1.1 shaders and weights. To build it yourself, run `tools/fsr4/build-fsr4-vk.sh`. It's an unofficial build, not made or endorsed by AMD, and its licences are listed in [the notice](externals/fsr4-vk/NOTICE.md).
+- **Windows (AMD's driver):** the setting's panel downloads AMD's signed FidelityFX runtime (FSR 4.1.2) from AMD after showing AMD's licence. Nothing of AMD's is in the Windows package.
+
+AMD, FidelityFX and FSR are trademarks of Advanced Micro Devices, Inc.
+
+**Status**
+
+This has only been played on an RX 9070 XT with Mesa 26.2.6, and the Windows route hasn't been tested at all, so expect rough edges. Please don't report problems from this build to upstream Lichii.
+
+No game data or precompile recipes are included. Shader preparation only runs if you've made a recipe from your own game with `tools/nx2-precompile`.
+
 <h2 align="center">⚠️ Lichii has no official website ⚠️</h2>
 
 > [!CAUTION]

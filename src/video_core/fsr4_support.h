@@ -11,11 +11,11 @@
 
 namespace VideoCommon {
 
-/// Whether a GPU is one AMD's FSR 4 runtime supports: Radeon RX 6000, 7000 and 9000 (and the
-/// matching Radeon PRO W cards), and the RDNA 3/3.5 integrated GPUs of Ryzen and Ryzen AI
-/// processors, on AMD's own Windows driver. Told apart by the Vulkan device name, which AMD's driver
-/// reports as for example "AMD Radeon RX 9070 XT" or "AMD Radeon(TM) 890M Graphics". AMD's runtime
-/// still decides at run time, so a wrong guess only shows or hides the option.
+/// Whether a GPU is one FSR 4 supports: Radeon RX 6000, 7000 and 9000 (and the matching Radeon PRO
+/// W cards), and the RDNA 3/3.5 integrated GPUs of Ryzen and Ryzen AI processors, on AMD's Windows
+/// driver or RADV (`amd_driver`). Told apart by the Vulkan device name, which is for example
+/// "AMD Radeon RX 9070 XT" or "AMD Radeon(TM) 890M Graphics". The runtime still decides at run time,
+/// so a wrong guess only shows or hides the option.
 constexpr bool IsFsr4CapableGpu(u32 vendor_id, bool amd_driver, std::string_view name) {
     constexpr u32 amd_vendor = 0x1002;
     if (vendor_id != amd_vendor || !amd_driver) {

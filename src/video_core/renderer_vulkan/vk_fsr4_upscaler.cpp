@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// AMD FSR 4 through AMD's FidelityFX runtime. The runtime takes plain Vulkan images: the inputs
+// AMD FSR 4 through an FFX API runtime: AMD's FidelityFX runtime on Windows, the fsr4-vk library
+// on Linux (RADV). The runtime takes plain Vulkan images: the inputs
 // in SHADER_READ_ONLY_OPTIMAL (FFX "compute read"), the output in GENERAL ("unordered access"),
 // and records into our command buffer. Picking the FSR 4 provider by version follows
 // CheezerWheezer's FSR 4 integration for CheezyEmu.
@@ -192,7 +193,7 @@ std::optional<Provider> FindFsr4(const FfxRuntime::Api& api, const Device& devic
 
 bool Fsr4Upscaler::IsWanted(const Device& device) {
 #if defined(__linux__) && !defined(__ANDROID__)
-    if (!Settings::values.amd_fsr4.GetValue()) {
+    if (!FfxRuntime::IsWanted(device.GetDriverID())) {
         return false;
     }
     const VideoCommon::Fsr4PortSupport support =
@@ -239,7 +240,12 @@ void Fsr4Upscaler::DestroyContext() {
 bool Fsr4Upscaler::CreateContext(VkExtent2D render_size, VkExtent2D upscale_size) {
     DestroyContext();
     ffxCreateBackendVKDesc backend{};
+#ifdef _WIN32
     backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+#else
+    // fsr4-vk only knows the older type number; its descriptor has the same layout.
+    backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK_DEPRECATED;
+#endif
     backend.header.pNext = nullptr;
     backend.deviceContext = DeviceContext(device);
     ffxOverrideVersion version_override{};

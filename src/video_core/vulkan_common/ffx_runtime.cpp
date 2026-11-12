@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <cstdlib>
 #include <mutex>
 #include <system_error>
 
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "video_core/vulkan_common/ffx_runtime.h"
 
 #ifdef _WIN32
@@ -25,6 +27,18 @@
 #endif
 
 namespace Vulkan::FfxRuntime {
+
+bool IsWanted(VkDriverId driver_id) {
+#ifdef _WIN32
+    return driver_id == VK_DRIVER_ID_AMD_PROPRIETARY && Settings::values.amd_fsr4.GetValue();
+#elif defined(__linux__) && !defined(__ANDROID__)
+    const char* const override = std::getenv("EDEN_NX2_FSR4_LIB");
+    return driver_id == VK_DRIVER_ID_MESA_RADV &&
+           (Settings::values.amd_fsr4.GetValue() || (override && override[0] != '\0'));
+#else
+    return false;
+#endif
+}
 
 std::filesystem::path Folder() {
     return Common::FS::GetEdenPath(Common::FS::EdenPath::FidelityFxDir);
@@ -208,7 +222,14 @@ bool HasSha256(const std::filesystem::path&, std::string_view) {
 #if defined(__linux__) && !defined(__ANDROID__)
 
 std::filesystem::path PortLibrary() {
+    if (const char* path = std::getenv("EDEN_NX2_FSR4_LIB"); path && path[0] != '\0') {
+        return path;
+    }
     std::error_code ec;
+    const std::filesystem::path user = Folder() / PORT_LIBRARY;
+    if (std::filesystem::is_regular_file(user, ec)) {
+        return user;
+    }
     const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
     if (!ec) {
         const std::filesystem::path bundled =
@@ -217,8 +238,13 @@ std::filesystem::path PortLibrary() {
             return bundled;
         }
     }
-    const std::filesystem::path user = Folder() / PORT_LIBRARY;
-    return std::filesystem::is_regular_file(user, ec) ? user : std::filesystem::path{};
+    if (!ec) {
+        const auto adjacent = exe.parent_path() / PORT_LIBRARY;
+        if (std::filesystem::is_regular_file(adjacent, ec)) {
+            return adjacent;
+        }
+    }
+    return {};
 }
 
 namespace {

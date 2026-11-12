@@ -95,8 +95,9 @@ inline bool DrawReuseProbeEnabled() {
 struct MeshEmulationSetup {
     std::vector<u32> vertex_spirv;
     u32 output_binding{};
-    u32 block_words{};    ///< output words per mesh workgroup
-    u32 max_primitives{}; ///< triangles per mesh workgroup
+    u32 block_words{};          ///< output words per mesh workgroup
+    u32 max_primitives{};       ///< primitives per mesh workgroup
+    u32 primitive_vertices{3};  ///< vertices per primitive: 1 points, 2 lines, 3 triangles
     // With a task program (stage 0, the mesh program at mesh_stage): its payload buffer and the
     // distribution pass's offsets and arguments (Shader::RuntimeInfo), and that pass's shader.
     bool has_task{};
@@ -202,9 +203,10 @@ public:
         return mesh_emulation ? u64{mesh_emulation->block_words} * 4 : 0;
     }
 
-    /// Vertices of the emulation's triangle list for one mesh workgroup.
+    /// Vertices of the emulation's point, line or triangle list for one mesh workgroup.
     [[nodiscard]] u32 MeshEmulationVerticesPerGroup() const noexcept {
-        return mesh_emulation ? mesh_emulation->max_primitives * 3 : 0;
+        return mesh_emulation ? mesh_emulation->max_primitives * mesh_emulation->primitive_vertices
+                              : 0;
     }
 
     /// The emulation's setup (output layout), or null.
@@ -390,6 +392,21 @@ public:
     /// ConfigureDelta prepares none, Configure does.
     [[nodiscard]] bool DeltaImagesChange() const noexcept;
 
+    /// The shader info of a pipeline stage (vertex B to fragment), null for a stage it lacks.
+    [[nodiscard]] const Shader::Info* StageInfo(size_t stage) const noexcept {
+        return stage_present[stage] ? &stage_infos[stage] : nullptr;
+    }
+
+    /// Built from a precompiled pipeline's recorded environments and shader infos (see
+    /// PipelineCache::CreatePrecompiledGraphicsPipeline): a failed build is replaced by a
+    /// pipeline translated from the game's state.
+    void MarkPrecompiled() noexcept {
+        precompiled = true;
+    }
+    [[nodiscard]] bool IsPrecompiled() const noexcept {
+        return precompiled;
+    }
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
@@ -438,6 +455,8 @@ private:
     std::array<std::vector<u8>, NUM_STAGES> kept_spirv; ///< zstd, after the build
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
+    std::array<bool, NUM_STAGES> stage_present{};
+    bool precompiled{};
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     u32 num_descriptor_entries{};

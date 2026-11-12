@@ -559,8 +559,10 @@ public:
     Common::SpinRecursiveMutex mutex;
     Runtime& runtime;
     bool any_buffer_uploaded = false;
-    /// Indirectly read banks of native programs already uploaded this frame.
-    std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
+    /// Indirectly read banks of native programs already uploaded this frame, by start address,
+    /// with the largest size uploaded from there.
+    std::unordered_map<DAddr, u32> native_indirect_uniforms_this_frame;
+    Common::RangeSet<DAddr> native_indirect_uniform_ranges_this_frame;
 
 private:
     template <typename Mask, typename Func>
@@ -814,6 +816,20 @@ private:
         u32 large_logged{};
         std::chrono::steady_clock::time_point last{};
     } create_trace;
+
+    /// The last index buffer UpdateIndexBuffer resolved, and what it depends on.
+    struct IndexBufferMemo {
+        const void* channel{};
+        const void* memory{};
+        GPUVAddr begin{};
+        GPUVAddr end{};
+        u64 map_serial{~u64{0}};
+        u64 deletions{};
+        DAddr device_addr{};
+        u32 found_size{}; ///< The size FindBuffer was asked for: the buffer holds at least this
+        BufferId buffer_id{};
+    };
+    IndexBufferMemo index_buffer_memo;
     struct GeometryStats {
         u64 syncs{};
         u64 syncs_skipped{};

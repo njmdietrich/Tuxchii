@@ -16,16 +16,20 @@
 #endif
 
 #include "video_core/vulkan_common/ffx_files.h"
+#include "video_core/vulkan_common/vulkan.h"
 
 namespace Vulkan::FfxRuntime {
 
-/// The FFX API entry points of AMD's loader.
+/// The FFX API entry points of the runtime: AMD's loader on Windows, the bundled fsr4-vk library
+/// on Linux.
 struct Api {
     PfnFfxCreateContext create_context{};
     PfnFfxDestroyContext destroy_context{};
     PfnFfxQuery query{};
     PfnFfxDispatch dispatch{};
 };
+
+[[nodiscard]] bool IsWanted(VkDriverId driver_id);
 
 /// On Windows, loads AMD's runtime after checking every file, or null when a file is missing,
 /// doesn't match or the loader lacks its exports (the log says which). Files that passed are not

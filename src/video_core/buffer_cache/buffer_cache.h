@@ -162,6 +162,7 @@ void BufferCache<P>::TickFrame() {
         }
         keep.kept = keep.streamed_binds = keep.verified = keep.mismatches = 0;
     }
+    native_indirect_uniform_ranges_this_frame.Clear();
     if (frame_tick % 600 == 0 && !uploaded_buffer_ranges.empty()) {
         for (const auto& [address, size] : uploaded_buffer_ranges) {
             device_memory.HintCold(address, size);
@@ -2598,10 +2599,23 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             return alignment > 1 && (offset % alignment) != 0;
         }
     }();
+    // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
+    // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
+    // the memory tracker, leaving stale host contents, so upload such a bank again once per frame.
+    // Banks are keyed by the bytes they cover, not their start address: Ocarina of Time binds
+    // thousands of overlapping 64 KiB windows a frame (one per draw in Hyrule Castle Town), and
+    // uploading each window whole copied ~64 KiB per draw, which left the GPU thread at 2 fps.
+    // A start address already uploaded this frame is skipped only up to the size uploaded from
+    // it: a larger bind there still uploads its tail.
+    const auto uploaded_from_here = [&] {
+        const auto it = native_indirect_uniforms_this_frame.find(device_addr);
+        return it != native_indirect_uniforms_this_frame.end() && it->second >= size;
+    };
     if (native_bank &&
-        (Nx2Perf::Verify() || !native_indirect_uniforms_this_frame.contains(device_addr)) &&
-        !memory_tracker.IsRegionGpuModified(device_addr, size) &&
-        native_indirect_uniforms_this_frame.insert(device_addr).second) {
+        (Nx2Perf::Verify() || !uploaded_from_here()) &&
+        !memory_tracker.IsRegionGpuModified(device_addr, size)) {
+        u32& uploaded_size = native_indirect_uniforms_this_frame[device_addr];
+        uploaded_size = (std::max)(uploaded_size, size);
         // The bank size is only an upper limit: stop at the end of the mapped memory.
         u64 mapped_size = 0;
         while (mapped_size < size &&
@@ -2610,12 +2624,40 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         const u64 upload_size = (std::min<u64>)(mapped_size, size);
         if (upload_size != 0) {
-            std::array<BufferCopy, 1> copies{BufferCopy{
-                .src_offset = 0,
-                .dst_offset = buffer.Offset(device_addr),
-                .size = upload_size,
-            }};
-            UploadMemory(buffer, upload_size, upload_size, copies);
+            if (Nx2Perf::Verify()) {
+                native_indirect_uniform_ranges_this_frame.Subtract(device_addr, upload_size);
+            }
+            // Upload only the parts no other bank uploaded this frame.
+            boost::container::small_vector<BufferCopy, 4> copies;
+            u64 total_size = 0;
+            u64 largest_copy = 0;
+            const auto add_copy = [&](DAddr begin, DAddr end) {
+                const u64 copy_size = end - begin;
+                copies.push_back(BufferCopy{
+                    .src_offset = total_size,
+                    .dst_offset = buffer.Offset(begin),
+                    .size = copy_size,
+                });
+                total_size += copy_size;
+                largest_copy = (std::max)(largest_copy, copy_size);
+            };
+            DAddr cursor = device_addr;
+            const DAddr upload_end = device_addr + upload_size;
+            native_indirect_uniform_ranges_this_frame.ForEachInRange(
+                device_addr, upload_size, [&](DAddr covered_begin, DAddr covered_end) {
+                    if (covered_begin > cursor) {
+                        add_copy(cursor, covered_begin);
+                    }
+                    cursor = (std::max)(cursor, covered_end);
+                });
+            if (cursor < upload_end) {
+                add_copy(cursor, upload_end);
+            }
+            if (!copies.empty()) {
+                native_indirect_uniform_ranges_this_frame.Add(device_addr, upload_size);
+                UploadMemory(buffer, total_size, largest_copy,
+                             std::span<BufferCopy>(copies.data(), copies.size()));
+            }
         }
     }
     const bool use_fast_buffer = needs_alignment_stream
@@ -3070,18 +3112,62 @@ void BufferCache<P>::UpdateIndexBuffer() {
 
     const GPUVAddr gpu_addr_begin = index_buffer_ref.StartAddress();
     const GPUVAddr gpu_addr_end = index_buffer_ref.EndAddress();
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
-    const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
     const u32 draw_size = (index_buffer_ref.count + index_buffer_ref.first) * u32(index_buffer_ref.FormatSizeInBytes());
+    // The draw macros mark the index buffer dirty on every draw, mostly with the same buffer and
+    // another count: the address and the buffer found are kept while the range, the GPU mappings
+    // and the buffers are, for any size up to the one the buffer was found for.
+    IndexBufferMemo& memo = index_buffer_memo;
+    const u64 map_serial = gpu_memory->MapSerial();
+    const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
     const u32 size = (std::min)(address_size, draw_size);
+    const bool memo_hit = memo.channel == channel_state && memo.memory == gpu_memory &&
+                          memo.begin == gpu_addr_begin && memo.end == gpu_addr_end &&
+                          memo.map_serial == map_serial && memo.deletions == buffer_deletions &&
+                          size != 0 && size <= memo.found_size &&
+                          !Settings::IsGPUFenceBehaviorAccurate(); // FindBuffer waits for writes
+    if (memo_hit && !Nx2Perf::Verify()) {
+        channel_state->index_buffer = Binding{
+            .device_addr = memo.device_addr,
+            .size = size,
+            .buffer_id = memo.buffer_id,
+        };
+        return;
+    }
+    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
     if (size == 0 || !device_addr) {
         channel_state->index_buffer = NULL_BINDING;
         return;
     }
+    const BufferId buffer_id = FindBuffer(*device_addr, size, false);
     channel_state->index_buffer = Binding{
         .device_addr = *device_addr,
         .size = size,
-        .buffer_id = FindBuffer(*device_addr, size, false),
+        .buffer_id = buffer_id,
+    };
+    if (memo_hit) {
+        if (memo.device_addr != *device_addr || memo.buffer_id != buffer_id) {
+            static std::atomic<u32> reports{};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_ERROR(HW_GPU,
+                          "Nx2Perf index buffer memo mismatch: {:#x}+{:#x} kept {:#x} buffer {}, "
+                          "found {:#x} buffer {}",
+                          gpu_addr_begin, size, memo.device_addr, memo.buffer_id.index,
+                          *device_addr, buffer_id.index);
+            }
+        }
+        return;
+    }
+    // FindBuffer may have deleted buffers (joins): the deletion count is read after it.
+    memo = IndexBufferMemo{
+        .channel = channel_state,
+        .memory = gpu_memory,
+        .begin = gpu_addr_begin,
+        .end = gpu_addr_end,
+        .map_serial = map_serial,
+        .deletions = buffer_deletions,
+        .device_addr = *device_addr,
+        .found_size = size,
+        .buffer_id = buffer_id,
     };
 }
 

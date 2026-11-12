@@ -288,6 +288,14 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     const u64 report_size = has_timestamp ? 16 : 4;
     const bool immediate =
         !is_fence && !Settings::IsGPULevelHigh() && counter_type == QueryType::Payload;
+    // A fence-flagged payload release writes a constant, so at low accuracy with Default fences
+    // it stays synchronized as before #337: its fence may be skipped and the query freed at once.
+    // Only reports of GPU counters wait for their fence to run.
+    const bool is_synced = is_fence && counter_type == QueryType::Payload &&
+                           (Settings::IsGPUFenceBehaviorDefault()
+                                ? !Settings::IsGPULevelHigh()
+                                : !Settings::IsGPUFenceBehaviorBalanced() &&
+                                      !Settings::IsGPUFenceBehaviorAccurate());
     // Written later: the buffer cache keeps GPU writes over it until then (NoteReportPending).
     const bool report_noted =
         !immediate && impl->rasterizer.NoteReportPending(cpu_addr, report_size);
@@ -302,6 +310,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         u32 asid;
         u8 counter_type;
         bool mirrored;
+        bool synced;
         bool wide;
         bool noted;
     };
@@ -313,6 +322,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         .asid = static_cast<u32>(gpu_memory->GetID()),
         .counter_type = static_cast<u8>(counter_type),
         .mirrored = mirrored,
+        .synced = is_synced,
         .wide = has_timestamp,
         .noted = report_noted,
     };
@@ -322,6 +332,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         const size_t asid = op.asid;
         const QueryType counter_type = static_cast<QueryType>(op.counter_type);
         const bool mirrored = op.mirrored;
+        const bool is_synced = op.synced;
         const u64 report_size = op.wide ? 16 : 4;
         const QueryLocation query_location = op.location;
         QueryBase* const query_base = op.query;
@@ -339,7 +350,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                          trace, asid, addr, cpu_addr, static_cast<u32>(counter_type),
                          static_cast<u32>(query_base->flags));
             }
-            impl->pending_unregister.push_back(query_location);
+            if (!is_synced) {
+                impl->pending_unregister.push_back(query_location);
+            }
             return;
         }
         if (False(query_base->flags & QueryFlagBits::IsFinalValueSynced)) [[unlikely]] {
@@ -352,7 +365,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             }
             LOG_ERROR(HW_GPU,
                       "Query report value not synchronized. Consider increasing GPU accuracy.");
-            impl->pending_unregister.push_back(query_location);
+            if (!is_synced) {
+                impl->pending_unregister.push_back(query_location);
+            }
             return;
         }
         query_base->value += streamer->GetAmendValue();
@@ -390,15 +405,21 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                      wide ? query_base->value : static_cast<u32>(query_base->value),
                      static_cast<u32>(query_base->flags));
         }
-        impl->pending_unregister.push_back(query_location);
+        if (!is_synced) {
+            impl->pending_unregister.push_back(query_location);
+        }
     };
     static_assert(sizeof(operation_body) <= 48,
                   "the report operation must fit MSVC's std::function storage");
     std::function<void()> operation(operation_body);
     if (is_fence) {
-        VideoCore::g_signaling_query_report_fence = true;
+        VideoCore::g_signaling_query_report_fence = !is_synced;
         impl->rasterizer.SignalFence(std::move(operation));
         VideoCore::g_signaling_query_report_fence = false;
+        if (is_synced) {
+            streamer->Free(new_query_id);
+            return;
+        }
     } else {
         if (immediate) {
             FinishReads(cpu_addr, has_timestamp ? 16 : 4);
