@@ -229,6 +229,17 @@ jobs:
             echo "applied classic-ui-setting.patch"
             echo "CLASSIC_UI_DEFAULT=1" >> "$GITHUB_ENV"
           fi
+          # 9. Fritchii builds never run frame generation (Settings::FrameGenActive() is always false;
+          #    upstream turned it off in v5.5 to keep its frame pacing). Fritchii's interface hides those
+          #    options; hide them in the classic interface too, so they don't look like they work.
+          #    Skipped if upstream ever lets frame generation run again.
+          f=src/yuzu/fritchii/fritchii_ui.cpp
+          if grep -qF 'return Enabled() && label.starts_with("frame_gen");' "$f" 2>/dev/null &&
+             grep -qF 'return values.frame_gen.GetValue() && !fritchii;' src/common/settings.cpp; then
+            sed -i 's|return Enabled() && label.starts_with("frame_gen");|return label.starts_with("frame_gen"); // Linux build patch: hidden in both interfaces|' "$f"
+            grep -qF 'Linux build patch: hidden in both interfaces' "$f" && echo "patched: frame generation options hidden" &&
+              echo "HIDE_FRAME_GEN=1" >> "$GITHUB_ENV"
+          fi
           # 6. Any other .patch files on this branch (test fixes on a testing branch), in name order.
           extra=""
           for p in _linux-patches/.github/linux-patches/*.patch; do
@@ -512,6 +523,9 @@ jobs:
           if os.environ.get("TUXCHII_BRANDING") == "1":
               bullets += (f"- **Tuxchii name** in every window and dialog. Data folders, settings and saves are unchanged, "
                           f"so nothing moves ([script]({link('tuxchii-branding.py')}))\n")
+          if os.environ.get("HIDE_FRAME_GEN") == "1":
+              bullets += ("- **No dead Frame Generation options:** Fritchii doesn't use frame generation (it would undo its frame pacing), "
+                          "so its options did nothing in the classic interface. They are now hidden there, as in Fritchii's own interface\n")
           if "steam-deck-test.patch" in applied:
               bullets += (f"- **Prepare Shaders on AMD and Intel (Steam Deck too):** upstream only prepares shaders on NVIDIA; Mesa drivers (RADV, ANV, NVK) "
                           f"now get them as well, the classic interface shows the \"Preparing shaders\" screen, and a Steam Deck switches to handheld mode once "
