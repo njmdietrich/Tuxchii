@@ -32,6 +32,7 @@ on a chosen branch. It uploads artifacts without creating tags or releases.
 
 - Use clang/lld 23 and the checked-in `eglantine.profdata`, verified with llvm-profdata.
 - Build CMake targets `yuzu` (the `lichii` Qt binary) and `yuzu-cmd` (`eden-cli`).
+- Use a dedicated Python environment with pinned `zstandard` for asset compression.
 - Run `tools/fsr4-vk/build.sh` to verify AMD's pinned DLL, generate shader/model assets,
   and build `amd_fidelityfx_upscaler_vk` with embedded, compressed assets. The shader conversion
   tools are built automatically from fsr4-vk's pinned submodules during setup.

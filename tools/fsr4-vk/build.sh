@@ -61,6 +61,7 @@ git -C "$src" submodule update -q --init --recursive --depth 1
 python3 "$src/tools/setup.py" --dll "$work/amd_fidelityfx_upscaler_dx12.dll"
 cmake -S "$src" -B "$src/build/linux" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DFSR4_EMBEDDED_ASSETS=ON -DFSR4_COMPRESS_SHADERS=ON \
+    "-DPython3_EXECUTABLE=$(command -v python3)" \
     "-DFSR4_ASSET_ROOT=$src/assets"
 cmake --build "$src/build/linux" --target amd_fidelityfx_upscaler_vk \
     --parallel "${FSR4_BUILD_JOBS:-$(nproc)}"
