@@ -107,8 +107,9 @@ the game keeps its own pass whenever DLSS is off, unavailable or fails to start.
   packages carry `usr/lib/amd_fidelityfx_upscaler_vk.so` and, in `usr/share/licenses/fsr4-vk`,
   fsr4-vk's licences and AMD's SDK licence. The aarch64 packages don't: fsr4-vk's shader
   conversion fails its own asset check on arm64 hosts. The loader first checks
-  `EDEN_NX2_FSR4_LIB`, then the user folder's `fidelityfx` folder, the packaged `usr/lib` folder,
-  and next to the executable. `EDEN_NX2_FSR4_LIB` enables FSR 4 without the setting. The setting is shown for RDNA 2 and newer Radeons on RADV
+  `EDEN_NX2_FSR4_LIB`, then the user folder's `fidelityfx` folder, the user folder itself (as in
+  Lichiistein), the packaged `usr/lib` folder, and next to the executable.
+  `EDEN_NX2_FSR4_LIB` enables FSR 4 without the setting. The setting is shown for RDNA 2 and newer Radeons on RADV
   (`VideoCommon::IsFsr4PortGpu`). At boot `VideoCommon::CheckFsr4Port` checks what fsr4-vk's
   shaders use on the created device (descriptor buffers, synchronization2, 32-lane compute
   subgroups, 8/16-bit arithmetic with integer dot products, linear compute derivatives) and picks

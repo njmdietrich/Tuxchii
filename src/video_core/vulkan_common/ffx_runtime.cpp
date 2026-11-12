@@ -230,6 +230,11 @@ std::filesystem::path PortLibrary() {
     if (std::filesystem::is_regular_file(user, ec)) {
         return user;
     }
+    const auto legacy_user =
+        Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) / PORT_LIBRARY;
+    if (std::filesystem::is_regular_file(legacy_user, ec)) {
+        return legacy_user;
+    }
     const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
     if (!ec) {
         const std::filesystem::path bundled =
