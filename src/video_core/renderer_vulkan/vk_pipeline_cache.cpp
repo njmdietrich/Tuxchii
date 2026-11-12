@@ -2232,20 +2232,6 @@ void PipelineCache::CanonicalizeNativeKey(
     key.state.CanonicalizeNative(mask);
 }
 
-namespace {
-/// Whether the driver keeps compiled pipelines in a cache of its own (the proprietary NVIDIA and
-/// AMD drivers), where the preparation step leaves them.
-bool DriverCachesPipelines(const Device& device) {
-    switch (device.GetDriverID()) {
-    case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
-    case VK_DRIVER_ID_AMD_PROPRIETARY:
-        return true;
-    default:
-        return false;
-    }
-}
-} // Anonymous namespace
-
 void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                                        std::stop_token stop_loading,
                                        const VideoCore::DiskResourceLoadCallback& callback) {
@@ -2261,7 +2247,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     }
     // The prepared pipelines are kept by the driver's own cache. Without one they would go to the
     // emulator's pipeline cache file, which is loaded whole at boot: only on request there.
-    if (!DriverCachesPipelines(device) && !(enabled && enabled[0] == '1')) {
+    if (!device.DriverCachesPipelines() && !(enabled && enabled[0] == '1')) {
         LOG_INFO(Render_Vulkan, "Precompiled pipelines skipped: the driver keeps no pipeline cache "
                                 "of its own (EDEN_NX2_PRECOMPILED=1 prepares them anyway)");
         return;

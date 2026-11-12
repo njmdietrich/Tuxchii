@@ -64,7 +64,9 @@ vertex program's header; a program found to load an attribute its header does no
 its pipeline is dropped once, and its keys keep every attribute type from then on.
 
 The preparation step needs a driver that keeps its own pipeline cache (NVIDIA and AMD's proprietary
-drivers, as `DriverCachesPipelines` lists); elsewhere it runs only with `EDEN_NX2_PRECOMPILED=1`.
+drivers, or RADV with Mesa's shader cache enabled, as `Device::DriverCachesPipelines` lists).
+Elsewhere it runs only with `EDEN_NX2_PRECOMPILED=1`. RADV's cache is treated as disabled when
+`MESA_SHADER_CACHE_DISABLE` or `MESA_GLSL_CACHE_DISABLE` is set to a true value.
 Records carry the driver of the machine that recorded them; they are prepared with this machine's,
 as draws key them, so a driver update only means preparing again.
 
