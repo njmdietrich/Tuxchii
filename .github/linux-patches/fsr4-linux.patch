@@ -1,5 +1,5 @@
 diff --git a/src/qt_common/util/vk.cpp b/src/qt_common/util/vk.cpp
-index 11a355ae66..dcc9286b17 100644
+index 11a355a..dcc9286 100644
 --- a/src/qt_common/util/vk.cpp
 +++ b/src/qt_common/util/vk.cpp
 @@ -68,7 +68,13 @@ void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
@@ -18,7 +18,7 @@ index 11a355ae66..dcc9286b17 100644
          std::string driver_string = Vulkan::vk::GetDriverName(driver_properties);
  
 diff --git a/src/video_core/renderer_vulkan/vk_fsr4_upscaler.cpp b/src/video_core/renderer_vulkan/vk_fsr4_upscaler.cpp
-index 78c4f00671..8b458bde2b 100644
+index 78c4f00..678e59b 100644
 --- a/src/video_core/renderer_vulkan/vk_fsr4_upscaler.cpp
 +++ b/src/video_core/renderer_vulkan/vk_fsr4_upscaler.cpp
 @@ -149,7 +149,12 @@ std::optional<Provider> FindFsr4(const FfxRuntime::Api& api, const Device& devic
@@ -35,8 +35,23 @@ index 78c4f00671..8b458bde2b 100644
  }
  
  Fsr4Upscaler::Fsr4Upscaler(const Device& device_, Scheduler& scheduler_,
+@@ -182,7 +187,14 @@ void Fsr4Upscaler::DestroyContext() {
+ bool Fsr4Upscaler::CreateContext(VkExtent2D render_size, VkExtent2D upscale_size) {
+     DestroyContext();
+     ffxCreateBackendVKDesc backend{};
++#if defined(__linux__) && !defined(__ANDROID__)
++    // Linux build patch: fsr4-vk only recognises the older VK backend descriptor type (same
++    // layout: device, physical device, vkGetDeviceProcAddr); the current type made
++    // ffxCreateContext fail with FFX_API_RETURN_ERROR_PARAMETER (6).
++    backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK_DEPRECATED;
++#else
+     backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
++#endif
+     backend.header.pNext = nullptr;
+     backend.deviceContext = DeviceContext(device);
+     ffxOverrideVersion version_override{};
 diff --git a/src/video_core/vulkan_common/ffx_runtime.cpp b/src/video_core/vulkan_common/ffx_runtime.cpp
-index c9432c9a5d..bf53dc215a 100644
+index c9432c9..bf53dc2 100644
 --- a/src/video_core/vulkan_common/ffx_runtime.cpp
 +++ b/src/video_core/vulkan_common/ffx_runtime.cpp
 @@ -21,6 +21,9 @@
@@ -135,7 +150,7 @@ index c9432c9a5d..bf53dc215a 100644
  
  bool IsSignedByAmd(const std::filesystem::path&) {
 diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
-index b7289d95ad..f947908324 100644
+index b7289d9..f947908 100644
 --- a/src/video_core/vulkan_common/vulkan_device.cpp
 +++ b/src/video_core/vulkan_common/vulkan_device.cpp
 @@ -504,6 +504,11 @@ bool WantsAmdFsr4(VkDriverId driver_id) {
@@ -151,10 +166,10 @@ index b7289d95ad..f947908324 100644
      return false;
  #endif
 diff --git a/src/yuzu/configuration/configure_graphics.cpp b/src/yuzu/configuration/configure_graphics.cpp
-index e9e7405342..77bfde9234 100644
+index 36ba1f3..75143c2 100644
 --- a/src/yuzu/configuration/configure_graphics.cpp
 +++ b/src/yuzu/configuration/configure_graphics.cpp
-@@ -572,7 +572,7 @@ void ConfigureGraphics::UpdateAmdFsr4Visibility() {
+@@ -555,7 +555,7 @@ void ConfigureGraphics::UpdateAmdFsr4Visibility() {
          return;
      }
      // AMD's FSR 4 runtime is Windows-only and runs on the GPUs IsFsr4CapableGpu names.
@@ -163,7 +178,7 @@ index e9e7405342..77bfde9234 100644
      const int device = vulkan_device_combobox ? vulkan_device_combobox->currentIndex() : -1;
      const bool capable = GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan &&
                           device >= 0 && static_cast<size_t>(device) < records.size() &&
-@@ -588,7 +588,12 @@ void ConfigureGraphics::UpdateAmdFsr4Visibility() {
+@@ -571,7 +571,12 @@ void ConfigureGraphics::UpdateAmdFsr4Visibility() {
      if (auto* view = qobject_cast<QListView*>(oot_aa_combobox->view()); view && fsr4_row >= 0) {
          view->setRowHidden(fsr4_row, !capable && !fsr4_picked);
      }
