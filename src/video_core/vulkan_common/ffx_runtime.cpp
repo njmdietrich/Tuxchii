@@ -237,8 +237,6 @@ std::filesystem::path PortLibrary() {
         if (std::filesystem::is_regular_file(bundled, ec)) {
             return bundled;
         }
-    }
-    if (!ec) {
         const auto adjacent = exe.parent_path() / PORT_LIBRARY;
         if (std::filesystem::is_regular_file(adjacent, ec)) {
             return adjacent;

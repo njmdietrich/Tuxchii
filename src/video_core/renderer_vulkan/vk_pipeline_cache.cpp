@@ -16,7 +16,6 @@
 #include <iostream>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -31,7 +30,6 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/memory_detect.h"
-#include "common/scope_exit.h"
 #include "common/thread.h"
 #include "common/thread_worker.h"
 #include "common/zstd_compression.h"
@@ -53,7 +51,6 @@
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "shader_recompiler/info_serialize.h"
-#include "common/zstd_compression.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/mesh_fallback_limits.h"
