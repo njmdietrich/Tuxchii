@@ -1,0 +1,22 @@
+Re-enable the existing frame generation setting in Tuxchii test builds.
+
+Fritchii disables frame generation by its internal build name in
+d64f34764a37ecc08be13ec88d1a76f3d3b48f2c. Tuxchii preserves that name,
+so its frame generation checkbox previously had no effect. Restore the
+existing setting-controlled path for both LSFG and built-in optical flow.
+
+No newer Lichii frame generation, pacing, HDR or DLSS changes are imported.
+
+diff --git a/src/common/settings.cpp b/src/common/settings.cpp
+--- a/src/common/settings.cpp
++++ b/src/common/settings.cpp
+@@ -426,8 +426,7 @@
+ }
+ 
+ bool FrameGenActive() {
+-    static const bool fritchii = std::string_view{Common::g_build_name} == "Fritchii";
+-    return values.frame_gen.GetValue() && !fritchii;
++    return values.frame_gen.GetValue();
+ }
+ 
+ namespace {
