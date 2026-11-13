@@ -371,6 +371,7 @@ private:
         const char* reason{};
         std::array<f32, 4> values{};
     } oot_camera_miss;
+    bool oot_guest_camera_reported{};
     std::optional<u64> oot_dlss_frame;
     std::array<f32, 2> oot_jitter_applied{}; ///< in the viewport state now (render pixels)
     std::array<f32, 2> oot_jitter_offset{};  ///< what oot_jitter_frame's scene draws used

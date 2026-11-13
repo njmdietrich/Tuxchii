@@ -40,6 +40,7 @@
 #include "video_core/buffer_cache/indirect_buffer.h"
 #include "video_core/native_query_trace.h"
 #include "video_core/native_indirect_reset.h"
+#include "video_core/ocarina_camera.h"
 #include "video_core/render_trace.h"
 #include "video_core/indirect_reset.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -3354,61 +3355,72 @@ void RasterizerVulkan::TrackOcarinaCamera() {
             oot_camera_miss = {render_trace_frame, rank, reason, values};
         }
     };
-    bool camera_bound = false;
-    buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
-                                                const auto& binding, u32 bound_size,
-                                                const auto*, u32) {
-        std::array<f32, 0x230 / sizeof(f32)> camera;
-        if (stage != 0 || storage || index != 3 || bound_size < sizeof(camera)) {
-            return;
-        }
-        camera_bound = true;
-        if (buffer_cache.IsRegionGpuModified(binding.device_addr, sizeof(camera))) {
-            miss(2, "no scene camera this frame: the camera buffer is GPU-written", {});
-            return;
-        }
-        device_memory.ReadBlockUnsafe(binding.device_addr, camera.data(), sizeof(camera));
-        constexpr size_t extent_offset = 0x120 / sizeof(f32);
-        constexpr size_t projection_wz = 0xa8 / sizeof(f32);
-        const f32 scene_width = camera[extent_offset];
-        const f32 scene_height = camera[extent_offset + 1];
-        const std::array<f32, 4> extents{scene_width, scene_height,
-                                         static_cast<f32>(color.size.width),
-                                         static_cast<f32>(color.size.height)};
-        if (!(scene_width >= 640.0f) || !(scene_height >= 360.0f) ||
-            scene_width > static_cast<f32>(color.size.width) ||
-            scene_height > static_cast<f32>(color.size.height)) {
-            miss(3, "no scene camera this frame: the camera's extent isn't the target's", extents);
-            return;
-        }
-        // The camera's extent is the scene's. The images are that size, or up to 15 pixels
-        // larger at the DLSS Balanced render scale, which draws 2276x1280 into 2288x1280
-        // (QuincyForbes' f7d0938b5b); only DLSS takes those.
-        const VkExtent2D scene{static_cast<u32>(scene_width), static_cast<u32>(scene_height)};
-        const bool padded = scene.width != color.size.width || scene.height != color.size.height;
-        if (static_cast<f32>(scene.width) != scene_width ||
-            static_cast<f32>(scene.height) != scene_height ||
-            color.size.width - scene.width >= 16 || color.size.height - scene.height >= 16 ||
-            (padded && oot_backend != VideoCommon::OcarinaUpscaleBackend::Dlss)) {
-            miss(3, "no scene camera this frame: the camera's extent isn't the target's", extents);
-            return;
-        }
-        if (camera[projection_wz] != -1.0f || camera[projection_wz + 1] != 0.0f) {
-            miss(4, "no scene camera this frame: not a perspective projection",
-                 {camera[projection_wz], camera[projection_wz + 1]});
-            return;
-        }
-        const std::span values{camera};
-        oot_camera_sample_frame = render_trace_frame;
-        oot_motion.camera_channel = gpu_memory;
-        oot_motion.extent = scene;
-        oot_motion.image_extent = {color.size.width, color.size.height};
-        std::copy_n(values.begin() + 0x30 / sizeof(f32), 16, oot_motion.current.begin());
-        std::copy_n(values.begin() + 0x180 / sizeof(f32), 16, oot_motion.previous.begin());
-    });
-    if (!camera_bound) {
-        miss(1, "no scene camera this frame: no camera buffer bound", {});
+    // Guest binding state is independent of which bytes the current shader happens to read.
+    // ForEachBoundBuffer filters unused slots and truncates ranges to shader usage, so a
+    // camera can disappear there when only the visible draws change.
+    const auto& binding = maxwell3d->state.shader_stages[0].const_buffers[3];
+    if (!binding.enabled || binding.address == 0) {
+        miss(1, "no scene camera this frame: guest vertex CB3 is disabled", {});
+        return;
     }
+    if (binding.size < VideoCommon::OcarinaCameraBytes) {
+        miss(1, "no scene camera this frame: guest vertex CB3 is too short",
+             {static_cast<f32>(binding.size), static_cast<f32>(VideoCommon::OcarinaCameraBytes)});
+        return;
+    }
+    if (!gpu_memory->IsFullyMappedRange(binding.address, VideoCommon::OcarinaCameraBytes) ||
+        !gpu_memory->IsContinuousRange(binding.address, VideoCommon::OcarinaCameraBytes)) {
+        miss(1, "no scene camera this frame: guest vertex CB3 is not continuously mapped", {});
+        return;
+    }
+    const auto device_address = gpu_memory->GpuToCpuAddress(binding.address);
+    if (!device_address) {
+        miss(1, "no scene camera this frame: guest vertex CB3 has no device address", {});
+        return;
+    }
+    if (buffer_cache.IsRegionGpuModified(*device_address, VideoCommon::OcarinaCameraBytes)) {
+        miss(2, "no scene camera this frame: the camera buffer is GPU-written", {});
+        return;
+    }
+    VideoCommon::OcarinaCameraBuffer values;
+    device_memory.ReadBlockUnsafe(*device_address, values.data(), sizeof(values));
+    const auto camera = VideoCommon::DecodeOcarinaCamera(
+        values, color.size.width, color.size.height,
+        oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss);
+    if (camera.issue == VideoCommon::OcarinaCameraIssue::Extent) {
+        miss(3, "no scene camera this frame: the camera's extent isn't the target's", camera.extents);
+        return;
+    }
+    if (camera.issue == VideoCommon::OcarinaCameraIssue::Projection) {
+        miss(4, "no scene camera this frame: not a perspective projection",
+             {camera.projection[0], camera.projection[1]});
+        return;
+    }
+    if (camera.issue != VideoCommon::OcarinaCameraIssue::None) {
+        return;
+    }
+    if (!oot_guest_camera_reported) {
+        u32 shader_bytes = 0;
+        buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
+                                                    const auto&, u32 size, const auto*, u32) {
+            if (stage == 0 && !storage && index == 3) {
+                shader_bytes = size;
+            }
+        });
+        if (shader_bytes < 0x230) {
+            LOG_INFO(Render_Vulkan,
+                     "Ocarina temporal: scene camera recovered from guest vertex CB3 "
+                     "({} declared bytes, {} shader-visible bytes)",
+                     binding.size, shader_bytes);
+            oot_guest_camera_reported = true;
+        }
+    }
+    oot_camera_sample_frame = render_trace_frame;
+    oot_motion.camera_channel = gpu_memory;
+    oot_motion.extent = {camera.width, camera.height};
+    oot_motion.image_extent = {color.size.width, color.size.height};
+    oot_motion.current = camera.current;
+    oot_motion.previous = camera.previous;
 }
 
 namespace {
@@ -3612,6 +3624,11 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
             return fail("no scene camera this frame: no scene-sized B10G11R11 draw with depth");
         }
         switch (miss.rank) {
+        case 1:
+            return fail(miss.reason, miss.values[1] == 0.0f
+                                        ? std::string{}
+                                        : fmt::format(", {} bytes, need {}", miss.values[0],
+                                                      miss.values[1]));
         case 3:
             return fail(miss.reason, fmt::format(", {}x{} for a {}x{} target", miss.values[0],
                                                  miss.values[1], miss.values[2], miss.values[3]));
