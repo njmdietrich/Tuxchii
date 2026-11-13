@@ -117,7 +117,7 @@ either changes. Making the same recipe twice gives the same file.
 
 One person does this per game version and cache version; everyone else only needs the recipe.
 
-1. Build Lichii and the tool with `-DENABLE_DEBUG_TOOLS=ON` (targets `yuzu` and `nx2-precompile`).
+1. Build Lichii and the tool with `-DENABLE_DEBUG_TOOLS=ON` (targets `lichii` and `nx2-precompile`).
    Check `nx2-precompile cache-version` against the Lichii build players will use; they must match.
    Install Python 3.11 or newer (no packages needed).
 2. Play the game in Lichii for a while, with the NVIDIA cache size set as above. Every pipeline the

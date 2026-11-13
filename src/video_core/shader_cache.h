@@ -52,8 +52,8 @@ struct ShaderInfo {
 u32 GenericReadMask(const Shader::ProgramHeader& sph) noexcept;
 
 class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
-    static constexpr u64 YUZU_PAGEBITS = 14;
-    static constexpr u64 YUZU_PAGESIZE = u64(1) << YUZU_PAGEBITS;
+    static constexpr u64 LICHII_PAGEBITS = 14;
+    static constexpr u64 LICHII_PAGESIZE = u64(1) << LICHII_PAGEBITS;
 
     static constexpr size_t NUM_PROGRAMS = 6;
 
@@ -197,6 +197,10 @@ private:
     /// Bounds of every address ever rejected (never shrinks): a quick test for invalidations.
     std::atomic<VAddr> rejected_lowest{~VAddr{}};
     std::atomic<VAddr> rejected_highest{};
+    /// Removals that freed programs; RefreshStages looks the stages up again after each one, since
+    /// shader_infos may point at a freed program.
+    std::atomic<u64> removal_serial{};
+    u64 seen_removal_serial{};
 };
 
 } // namespace VideoCommon

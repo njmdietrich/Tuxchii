@@ -7,7 +7,7 @@
 
 ## nx2 + Lichiistein Linux PGO integration
 
-This branch combines upstream Lichii `nx2` at `21d62e43ca` with Lichiistein at `8f55ee5593`,
+This branch combines upstream Lichii `nx2` at `f1cd98c105` with Lichiistein at `8f55ee5593`,
 preserving both histories. Some Lichiistein changes already have newer upstream equivalents;
 those upstream implementations are retained. See [the integration notes](docs/nx2/lichiistein-integration.md).
 
@@ -106,7 +106,7 @@ Do not upload game files, keys, firmware or private account information.
 
 ## Building and contributing
 
-See the [build guide](docs/Build.md), [user documentation](docs/user/README.md) and [coding guidelines](docs/Coding.md). Some inherited documentation and internal build target names still use upstream names. The GUI build target remains `yuzu`; its output is `lichii.exe` on Windows and `lichii` on other desktop platforms.
+See the [build guide](docs/Build.md), [user documentation](docs/user/README.md) and [coding guidelines](docs/Coding.md). Some inherited documentation and internal build target names still use upstream names. The GUI build target is `lichii`; its output is `lichii.exe` on Windows and `lichii` on other desktop platforms.
 
 Keep changes focused and distinguish code-level checks from actual gameplay testing.
 

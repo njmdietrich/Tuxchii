@@ -11,6 +11,10 @@ Sources at the start of the integration:
 - `auz466/Lichiistein:lichiistein`: `8f55ee5593f14b4dbc94f5393eb1692ca200778f`.
 - Git reports 96 non-merge Lichiistein commits without patch-equivalent commits in upstream.
 
+Latest upstream sync: `zortos293/Lichii:nx2` at
+`f1cd98c105048887871df4f8c96ec57214732f16`. The frontend and build targets now use
+upstream's `lichii` names; the shader recipe retention and FSR 4 feature fixes are retained.
+
 ## Merge decisions
 
 - Keep Lichiistein's recipes, precompilation, driver-crash journal, canonical native pipeline
@@ -31,7 +35,7 @@ pushes affecting build inputs on `nx2-lichiistein-linux-pgo`, or through `workfl
 on a chosen branch. It uploads artifacts without creating tags or releases.
 
 - Use clang/lld 23 and the checked-in `eglantine.profdata`, verified with llvm-profdata.
-- Build CMake targets `yuzu` (the `lichii` Qt binary) and `yuzu-cmd` (`eden-cli`).
+- Build CMake targets `lichii` (the `lichii` Qt binary) and `lichii-cmd` (`eden-cli`).
 - Use a dedicated Python environment with pinned `zstandard` for asset compression.
 - Run `tools/fsr4-vk/build.sh` to verify AMD's pinned DLL, generate shader/model assets,
   and build `amd_fidelityfx_upscaler_vk` with embedded, compressed assets. The shader conversion
