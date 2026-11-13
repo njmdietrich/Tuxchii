@@ -1245,8 +1245,10 @@ bool EmulatedController::SetVibration(DeviceIndex device_index, const VibrationV
         return false;
     }
 
-    // Skip duplicated vibrations
-    if (last_vibration_value[index] == vibration) {
+    const bool streamed = output_devices[index]->IsVibrationStreamed();
+    // Streamed backends need repeated nonzero samples to keep their watchdogs alive.
+    if (last_vibration_value[index] == vibration &&
+        (!streamed || (vibration.low_amplitude == 0.0f && vibration.high_amplitude == 0.0f))) {
         return Settings::values.vibration_enabled.GetValue();
     }
 
@@ -1264,8 +1266,7 @@ bool EmulatedController::SetVibration(DeviceIndex device_index, const VibrationV
         return false;
     }
 
-    if (!Settings::values.enable_accurate_vibrations.GetValue() &&
-        !output_devices[index]->IsVibrationStreamed()) {
+    if (!Settings::values.enable_accurate_vibrations.GetValue() && !streamed) {
         using std::chrono::duration_cast;
         using std::chrono::milliseconds;
         using std::chrono::steady_clock;

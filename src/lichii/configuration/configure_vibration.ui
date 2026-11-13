@@ -521,6 +521,16 @@
        </widget>
       </item>
       <item>
+       <widget class="QCheckBox" name="checkBoxSwitch2Haptics">
+        <property name="toolTip">
+         <string>Play each side and both vibration bands on a USB Switch 2 Pro Controller. Frequency translation is experimental and needs hardware calibration. Requires the patched SDL backend; otherwise standard rumble is used.</string>
+        </property>
+        <property name="text">
+         <string>Switch 2 Pro USB HD Rumble (experimental)</string>
+        </property>
+       </widget>
+      </item>
+      <item>
        <widget class="QCheckBox" name="checkBoxFrequencyRumble">
         <property name="toolTip">
          <string>On controllers with two rumble motors, send each part of the HD Rumble to the motor that matches its frequency: low tones to the heavy motor, high tones to the light one. When off, each band drives its own motor as before.</string>

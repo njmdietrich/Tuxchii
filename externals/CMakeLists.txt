@@ -152,7 +152,10 @@ if(ENABLE_CUBEB)
     endif()
 endif()
 
-if (NOT LICHII_USE_BUNDLED_SDL3)
+if (ENABLE_SWITCH2_HD_RUMBLE)
+    # The prebuilt SDL package has no Switch 2 custom-effect entry point.
+    AddJsonPackage(sdl3-hd-rumble)
+elseif (NOT LICHII_USE_BUNDLED_SDL3)
     if (NOT WIN32)
         # Yuzu itself needs: Atomic Audio Events Joystick Haptic Sensor Threads Timers
         # Since 2.0.18 Atomic+Threads required for HIDAPI/libusb (see https://github.com/libsdl-org/SDL/issues/5095)

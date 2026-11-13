@@ -40,11 +40,13 @@ ConfigureVibration::ConfigureVibration(QWidget* parent, Core::HID::HIDCore& hid_
     ui->checkBoxAccurateVibration->setChecked(
         Settings::values.enable_accurate_vibrations.GetValue());
     ui->checkBoxDualSenseHaptics->setChecked(Settings::values.enable_dualsense_haptics.GetValue());
+    ui->checkBoxSwitch2Haptics->setChecked(Settings::values.enable_switch2_hd_rumble.GetValue());
     ui->checkBoxFrequencyRumble->setChecked(Settings::values.rumble_frequency_mapping.GetValue());
 
     if (!Settings::IsConfiguringGlobal()) {
         ui->checkBoxAccurateVibration->setDisabled(true);
         ui->checkBoxDualSenseHaptics->setDisabled(true);
+        ui->checkBoxSwitch2Haptics->setDisabled(true);
         ui->checkBoxFrequencyRumble->setDisabled(true);
     }
 
@@ -71,6 +73,7 @@ void ConfigureVibration::ApplyConfiguration() {
     Settings::values.enable_accurate_vibrations.SetValue(
         ui->checkBoxAccurateVibration->isChecked());
     Settings::values.enable_dualsense_haptics.SetValue(ui->checkBoxDualSenseHaptics->isChecked());
+    Settings::values.enable_switch2_hd_rumble.SetValue(ui->checkBoxSwitch2Haptics->isChecked());
     Settings::values.rumble_frequency_mapping.SetValue(ui->checkBoxFrequencyRumble->isChecked());
 }
 

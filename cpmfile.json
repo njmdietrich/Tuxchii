@@ -265,6 +265,24 @@
         "repo": "libsdl-org/SDL",
         "version": "release-3.4.8"
     },
+    "sdl3-hd-rumble": {
+        "hash": "f9da28c2be54d0969627ba71baaf37e2070c51b35b84fd3366a1f32728cc69099814e1561e85016a719e4832dc6385d3efb3585fc609ea93c8a6bb4aa4b94afb",
+        "package": "SDL3",
+        "repo": "libsdl-org/SDL",
+        "version": "147a8ee32dbf9ac02f3794964490687b6bbda1bc",
+        "name": "SDL3",
+        "bundled": true,
+        "options": [
+            "SDL_SHARED OFF",
+            "SDL_STATIC ON",
+            "SDL_TEST_LIBRARY OFF",
+            "SDL_TESTS OFF",
+            "SDL_EXAMPLES OFF"
+        ],
+        "patches": [
+            "0001-switch2-pro-usb-hd-rumble.patch"
+        ]
+    },
     "sdl3-ci": {
         "ci": true,
         "name": "SDL3",

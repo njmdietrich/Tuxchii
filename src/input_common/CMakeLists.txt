@@ -64,6 +64,8 @@ else()
         helpers/joycon_driver.h
         helpers/rumble_mapping.cpp
         helpers/rumble_mapping.h
+        helpers/switch2_rumble.cpp
+        helpers/switch2_rumble.h
         helpers/joycon_protocol/calibration.cpp
         helpers/joycon_protocol/calibration.h
         helpers/joycon_protocol/common_protocol.cpp

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <numbers>
 #include <optional>
 #include "common/logging.h"
@@ -16,6 +17,7 @@
 #include "input_common/drivers/sdl_driver.h"
 #include "input_common/helpers/dualsense_haptics.h"
 #include "input_common/helpers/rumble_mapping.h"
+#include "input_common/helpers/switch2_rumble.h"
 
 namespace InputCommon {
 
@@ -236,6 +238,13 @@ public:
     bool RumblePlay(const Common::Input::VibrationStatus& vibration, f32 curve_factor) {
         constexpr u32 rumble_max_duration_ms = 2000;
         std::scoped_lock lock{rumble_mutex};
+        const u32 generation = rumble_generation.load(std::memory_order_acquire);
+        if (generation != rumble_seen_generation) {
+            rumble_seen_generation = generation;
+            switch2_hd_supported.reset();
+            switch2_rumble = {};
+            side_vibrations = {};
+        }
         // Both sides of the emulated controller can land on this pad. Keep each side's latest
         // vibration and play the stronger of the two on each motor, so one side doesn't
         // overwrite the other.
@@ -244,6 +253,9 @@ public:
         }
         if (vibration.side != Common::Input::VibrationSide::Left) {
             side_vibrations[1] = vibration;
+        }
+        if (Switch2HapticsPlay(vibration)) {
+            return true;
         }
         const auto map = Settings::values.rumble_frequency_mapping.GetValue()
                              ? MapRumbleByFrequency
@@ -277,6 +289,10 @@ public:
     bool IsHapticsOpen() {
         std::scoped_lock lock{haptics_mutex};
         return haptics.IsOpen();
+    }
+
+    bool IsSwitch2HapticsOpen() const {
+        return Settings::values.enable_switch2_hd_rumble.GetValue() && switch2_hd_active.load();
     }
 
     /// Closes the haptics when their audio device is removed: SDL keeps feeding the stream to a
@@ -363,6 +379,8 @@ public:
     }
 
     void SetSDLJoystick(SDL_Joystick* joystick, SDL_Gamepad* controller) {
+        switch2_hd_active = false;
+        rumble_generation.fetch_add(1, std::memory_order_release);
         {
             std::scoped_lock lock{haptics_mutex};
             haptics.Close();
@@ -462,6 +480,48 @@ public:
     }
 
 private:
+    // Called under rumble_mutex. SDL owns the USB connection and refreshes/stops the effects.
+    bool Switch2HapticsPlay(const Common::Input::VibrationStatus& vibration) {
+        SDL_Gamepad* const gamepad = sdl_controller.get();
+        if (!Settings::values.enable_switch2_hd_rumble.GetValue() || !gamepad ||
+            !Switch2Rumble::IsSupportedController(
+                SDL_GetGamepadVendor(gamepad), SDL_GetGamepadProduct(gamepad),
+                SDL_GetGamepadConnectionState(gamepad) == SDL_JOYSTICK_CONNECTION_WIRED)) {
+            switch2_hd_active = false;
+            switch2_rumble = {};
+            return false;
+        }
+        if (!switch2_hd_supported) {
+            switch2_hd_supported = SDL_SendGamepadEffect(
+                gamepad, Switch2Rumble::EffectMagic.data(),
+                static_cast<int>(Switch2Rumble::EffectMagic.size()));
+            LOG_INFO(Input, "Switch 2 Pro USB HD rumble: {}",
+                     *switch2_hd_supported
+                         ? "experimental frequency translation enabled"
+                         : "SDL backend unavailable; using standard rumble");
+        }
+        if (!*switch2_hd_supported) {
+            return false;
+        }
+        if (!switch2_hd_active.load()) {
+            // Cancel SDL's ordinary-rumble timer before it can stop a custom effect later.
+            SDL_RumbleGamepad(gamepad, 0, 0, 0);
+        }
+        const u64 now = SDL_GetTicks();
+        switch2_rumble.Update(vibration, now);
+        const auto effect = switch2_rumble.MakeEffect(now);
+        if (!SDL_SendGamepadEffect(gamepad, effect.data(), static_cast<int>(effect.size()))) {
+            LOG_WARNING(Input, "Switch 2 Pro USB HD rumble failed: {}; using standard rumble",
+                        SDL_GetError());
+            switch2_hd_supported = false;
+            switch2_hd_active = false;
+            switch2_rumble = {};
+            return false;
+        }
+        switch2_hd_active = true;
+        return true;
+    }
+
     bool UseDualSenseHaptics() {
         if (!Settings::values.enable_dualsense_haptics.GetValue()) {
             std::scoped_lock lock{haptics_mutex};
@@ -535,6 +595,11 @@ private:
 
     std::mutex rumble_mutex;
     std::array<Common::Input::VibrationStatus, 2> side_vibrations{};
+    Switch2Rumble::State switch2_rumble;
+    std::optional<bool> switch2_hd_supported;
+    std::atomic<bool> switch2_hd_active{};
+    std::atomic<u32> rumble_generation{};
+    u32 rumble_seen_generation{};
 };
 
 std::shared_ptr<SDLJoystick> SDLDriver::GetSDLJoystickByGUID(const Common::UUID& guid, int port) {
@@ -996,7 +1061,7 @@ bool SDLDriver::IsVibrationEnabled(const PadIdentifier& identifier) {
 
 bool SDLDriver::IsVibrationStreamed(const PadIdentifier& identifier) {
     const auto joystick = GetSDLJoystickByGUID(identifier.guid, static_cast<int>(identifier.port));
-    return joystick->IsHapticsOpen();
+    return joystick->IsHapticsOpen() || joystick->IsSwitch2HapticsOpen();
 }
 
 Common::ParamPackage SDLDriver::BuildAnalogParamPackageForButton(int port, const Common::UUID& guid,

@@ -260,6 +260,7 @@ if (MSVC OR ANDROID)
 endif()
 
 option(LICHII_USE_BUNDLED_SDL3 "Download bundled SDL3 build" ${EXT_DEFAULT})
+option(ENABLE_SWITCH2_HD_RUMBLE "Build SDL with experimental Switch 2 Pro USB HD rumble" OFF)
 
 # ffmpeg
 option(LICHII_USE_BUNDLED_FFMPEG "Download bundled FFmpeg" ${EXT_DEFAULT})

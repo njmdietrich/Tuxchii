@@ -954,6 +954,8 @@ struct Values {
                                            "enable_dualsense_haptics", Category::Controls};
     Setting<bool> rumble_frequency_mapping{linkage, false, "rumble_frequency_mapping",
                                            Category::Controls};
+    Setting<bool> enable_switch2_hd_rumble{linkage, false, "enable_switch2_hd_rumble",
+                                           Category::Controls};
 
     SwitchableSetting<bool> motion_enabled{linkage, true, "motion_enabled", Category::Controls};
     Setting<std::string> udp_input_servers{linkage, "127.0.0.1:26760", "udp_input_servers",
