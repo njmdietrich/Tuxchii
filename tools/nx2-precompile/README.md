@@ -205,6 +205,12 @@ u32 SPIR-V blobs[5] (per pipeline stage, ~0 for none), and per blob u64 offset, 
 Ocarina of Time: 753 MiB. The stamp holds the build's `scm_rev`: a build that changes the translator
 without a new revision needs `EDEN_NX2_PRECOMPILED_FORCE=1`, or its kept SPIR-V is the old one's.
 
+Selecting the same recipe again preserves an identical assembled file and its timestamp, keeping
+its preparation valid. A different emulator build, driver, GPU, recipe contents or shader settings
+can require preparation again. The log reports why preparation repeats, and warns when it cannot
+save the shader infos or completion stamp. Mesa's shader-cache size controls the driver's cache;
+it does not prevent the emulator from repeating translation when preparation is invalidated.
+
 ## Switches
 
 - `EDEN_NX2_PRECOMPILED=0`: skip the preparation step; `1`: run it also on drivers without their

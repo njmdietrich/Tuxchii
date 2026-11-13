@@ -2289,16 +2289,28 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         Settings::values.disable_shader_loop_safety_checks.GetValue(),
         Settings::values.renderer_debug.GetValue());
     const char* force = std::getenv("EDEN_NX2_PRECOMPILED_FORCE");
-    if (!(force && force[0] == '1')) {
+    if (force && force[0] == '1') {
+        LOG_INFO(Render_Vulkan,
+                 "Preparing precompiled pipelines again: EDEN_NX2_PRECOMPILED_FORCE=1");
+    } else {
         std::ifstream stamp_file(stamp_path, std::ios::binary);
+        const bool have_stamp = static_cast<bool>(stamp_file);
         const std::string previous{std::istreambuf_iterator<char>(stamp_file), {}};
         if (previous == stamp) {
             if (LoadPrecompiledInfos(path, infos_path, stamp)) {
                 LOG_INFO(Render_Vulkan, "Precompiled pipelines already prepared for this driver");
                 return;
             }
-            LOG_INFO(Render_Vulkan, "Precompiled pipelines were prepared without keeping their "
-                                    "shader infos: preparing them again");
+            LOG_INFO(Render_Vulkan, "Saved precompiled shader infos could not be reused: "
+                                    "preparing them again");
+        } else if (!have_stamp) {
+            LOG_INFO(Render_Vulkan,
+                     "Preparing precompiled pipelines: saved preparation stamp is missing or "
+                     "unreadable: {}", Common::FS::PathToUTF8String(stamp_path));
+        } else {
+            LOG_INFO(Render_Vulkan,
+                     "Preparing precompiled pipelines again: recipe, driver, build or shader "
+                     "settings changed; previous={:?}, current={:?}", previous, stamp);
         }
     }
 
@@ -2734,7 +2746,21 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         kept.file.seekp(static_cast<std::streamoff>(index_offset_at));
         put(kept.file, index_offset);
         kept.file.close();
+        if (!kept.file) {
+            LOG_ERROR(Render_Vulkan, "Could not finish writing precompiled shader infos: {}",
+                      Common::FS::PathToUTF8String(kept_temporary));
+            std::filesystem::remove(kept_temporary, error);
+            std::filesystem::remove(progress_path, error);
+            return;
+        }
         std::filesystem::rename(kept_temporary, infos_path, error);
+        if (error) {
+            LOG_ERROR(Render_Vulkan, "Could not save precompiled shader infos {}: {}",
+                      Common::FS::PathToUTF8String(infos_path), error.message());
+            std::filesystem::remove(kept_temporary, error);
+            std::filesystem::remove(progress_path, error);
+            return;
+        }
         LOG_INFO(Render_Vulkan,
                  "Precompiled shader infos and SPIR-V kept for {} pipelines: {} distinct infos, "
                  "{} distinct stages of SPIR-V ({} MiB compressed), {} MiB in all",
@@ -2749,6 +2775,11 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         std::ofstream stamp_file(stamp_path, std::ios::binary | std::ios::trunc);
         stamp_file << stamp;
         stamp_file.close();
+        if (!stamp_file) {
+            LOG_WARNING(Render_Vulkan,
+                        "Could not save recipe preparation stamp {}; the next launch may "
+                        "prepare again", Common::FS::PathToUTF8String(stamp_path));
+        }
     }
     std::filesystem::remove(progress_path, error);
     LoadPrecompiledInfos(path, infos_path, stamp);

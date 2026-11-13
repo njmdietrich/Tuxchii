@@ -191,6 +191,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 // Video Core //
 #include "video_core/gpu.h"
 #include "video_core/nx2_recipe.h"
+#include "video_core/precompiled_file.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
@@ -3244,22 +3245,8 @@ void MainWindow::OnGameListPrepareShadersFromRecipe(u64 program_id, const std::s
                      fmt::format("{:016x}", program_id);
     const auto path = dir / fmt::format("precompiled.fork-v{}.nx2prep",
                                         VideoCommon::VulkanPipelineCacheVersion);
-    auto temporary = path;
-    temporary += ".tmp";
-    bool written = Common::FS::CreateDirs(dir);
-    if (written) {
-        Common::FS::IOFile file{temporary, Common::FS::FileAccessMode::Write,
-                                Common::FS::FileType::BinaryFile};
-        written = file.IsOpen() &&
-                  file.WriteSpan(std::span<const u8>{outcome.file}) == outcome.file.size();
-    }
-    std::error_code error;
-    if (written) {
-        std::filesystem::rename(temporary, path, error);
-        written = !error;
-    }
-    if (!written) {
-        std::filesystem::remove(temporary, error);
+    const auto saved = VideoCommon::SavePrecompiledFile(path, outcome.file);
+    if (saved == VideoCommon::SavePrecompiledResult::Failed) {
         QMessageBox::warning(this, title,
                              tr("The precompiled pipelines could not be saved to %1.")
                                  .arg(QString::fromStdString(Common::FS::PathToUTF8String(path))));
@@ -3267,9 +3254,15 @@ void MainWindow::OnGameListPrepareShadersFromRecipe(u64 program_id, const std::s
     }
 
     const auto& report = outcome.report;
-    QString text = tr("%n pipeline(s) are ready to prepare. They are compiled the next time the "
-                      "game starts; that boot takes longer.",
-                      "", static_cast<int>(report.records));
+    const bool unchanged = saved == VideoCommon::SavePrecompiledResult::Unchanged;
+    LOG_INFO(Frontend, "Precompiled recipe: {} {}", Common::FS::PathToUTF8String(path),
+             unchanged ? "unchanged; keeping existing preparation" : "saved; preparation required");
+    QString text = unchanged
+                       ? tr("This recipe produces the same precompiled pipelines already saved. "
+                            "Existing shader preparation will be reused if it is still valid.")
+                       : tr("%n pipeline(s) are ready to prepare. They are compiled the next time "
+                            "the game starts; that boot takes longer.",
+                            "", static_cast<int>(report.records));
     if (report.programs_missing || report.records_dropped) {
         text += QStringLiteral("\n\n") +
                 tr("%1 of the recipe's %2 shaders are not in this copy of the game, so %3 "
